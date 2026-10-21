@@ -31,4 +31,4 @@ cryptography>=42.0
 
 qrcode>=8.2,<9
 
-aioapns>=3.0,<4
+aioapns>=4.0,<5
