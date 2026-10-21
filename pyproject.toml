@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hime"
+version = "1.0.0"
+description = "Personal Health AI Agent — autonomous LLM agent platform for wearable health data analysis"
+readme = "README.md"
+license = { text = "PolyForm Noncommercial 1.0.0" }
+requires-python = ">=3.10"
+authors = [{name = "CareAgent Organisation"}]
+keywords = ["health", "agent", "llm", "wearable", "apple-watch", "healthkit", "self-hosted"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+bedrock = ["boto3>=1.34"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/dreggler/health-care-agent"
+Repository = "https://github.com/dreggler/health-care-agent"
+Issues = "https://github.com/dreggler/health-care-agent/issues"
+Documentation = "https://github.com/dreggler/health-care-agent"
+
+[project.scripts]
+hime = "backend.main:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["backend/requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[tool.setuptools.package-data]
+"backend" = ["telegram/messages.json", "agent/tools/tools.json", "i18n/locales/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "data",
+    "memory",
+    "logs",
+    "frontend",
+    "ios",
+    "GLOBEM",
+    "APPLE",
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line-too-long (handled by formatter)
+    "B008",  # function calls in argument defaults (FastAPI Depends pattern)
+    "B904",  # raise without `from` inside except (used pervasively)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # allow assert False in tests
+"backend/agent/tools/page_helpers.py" = ["F821"]  # references injected globals (HEALTH_DB_PATH, MEMORY_DB_PATH)
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

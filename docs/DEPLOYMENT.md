@@ -1,0 +1,355 @@
+# CareAgent Deployment Guide
+
+This document covers deploying CareAgent beyond the single-machine "Quick start" flow in the README. Three deployment shapes are described, in order of complexity:
+
+1. **Local / LAN** — run CareAgent on a desktop or home server and access it from an iPhone / Apple Watch on the same network. Zero TLS, zero public endpoint.
+2. **Public internet** — expose CareAgent behind a reverse proxy with TLS, authentication, and CORS, so that you can reach it from anywhere.
+3. **Docker Compose production** — run the three services as long-lived containers with mounted volumes.
+
+Each shape builds on the previous one. Pick the lowest shape that meets your needs.
+
+## Deployment Methods
+
+CareAgent supports two deployment methods. **Choose one -- do not run both simultaneously** as they bind the same ports (8000, 5173, 8765).
+
+- **Docker Compose** (recommended for most users): `docker compose up --build`
+- **Native processes** (for development): `./hime.sh start`
+
+> If you want to expose CareAgent outside your LAN without running a reverse proxy yourself, you can use **any** tunneling solution of your choice (ngrok, tailscale, cloudflared, frp, bore, etc.). CareAgent does not endorse or require any specific vendor — treat the tunnel as opaque transport in front of the reverse-proxy configuration below.
+
+---
+
+## 1. Local / LAN deployment
+
+This is the target shape for most personal users. CareAgent runs on one machine and your iPhone connects to it over your home Wi-Fi.
+
+### 1.1. Choose a stable LAN address
+
+Give the host a predictable IP. Either reserve a DHCP lease in your router or assign a static IP on the host itself. Record it somewhere; you will type it into the iPhone app.
+
+```bash
+# Example on Linux:
+ip -4 addr show scope global | awk '/inet / {print $2}'
+# -> 192.168.1.100/24
+```
+
+### 1.2. Open the right ports on the host firewall
+
+CareAgent uses three TCP ports on the host:
+
+| Service        | Port | Protocol | Purpose                                   |
+|----------------|------|----------|-------------------------------------------|
+| Backend API    | 8000 | HTTP/WS  | FastAPI + agent WebSocket event stream    |
+| Frontend SPA   | 5173 | HTTP     | Vite dev server (React dashboard)         |
+| Watch Exporter | 8765 | HTTP/WS  | iPhone / Watch health-data ingestion      |
+
+On Linux with `ufw`:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8000 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 5173 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 8765 proto tcp
+```
+
+On macOS, open **System Settings → Network → Firewall** and allow `python3` and `node` to accept incoming connections, or disable the firewall on your trusted LAN.
+
+### 1.3. Point the iPhone app at the host
+
+1. Build and install the iPhone app (`ios/hime/hime.xcodeproj`) to your device.
+2. Open the CareAgent app → **Settings** → **Server URL**.
+3. Enter the host IP **without a scheme or port** (e.g. `192.168.1.100`). The app appends `:8765` for the Watch Exporter and `:8000` for the backend automatically.
+4. Grant HealthKit permission when prompted.
+
+### 1.4. mDNS (optional)
+
+If your host publishes a `.local` name via Avahi / Bonjour, you can type that into the iPhone app instead of a raw IP (for example `homelab.local`). This is more resilient to DHCP changes. Many consumer routers block mDNS by default; if the app cannot resolve the name, fall back to the IP.
+
+### 1.5. Verify
+
+From a second machine on the same LAN:
+
+```bash
+curl http://192.168.1.100:8000/health
+curl http://192.168.1.100:8765/ping
+```
+
+Both should respond. If either fails, re-check the firewall rules and that `./hime.sh status` shows all three services running.
+
+---
+
+## 2. Public internet deployment
+
+Use this shape if you want CareAgent to be reachable from outside your LAN. The only supported topology is **reverse proxy in front of the backend**, with TLS terminated at the proxy. Do **not** expose the FastAPI server directly to the public internet.
+
+This works the same on a VPS, a cloud VM, or a home server with a public IP. A LAN is not required.
+
+### 2.1. DNS and TLS prerequisites
+
+The iOS app derives every service URL from a single domain you type into Settings. For a domain such as `example.com` it connects to **fixed subdomains**:
+
+| Hostname | Used by | Proxies to |
+|---|---|---|
+| `api.example.com` | iOS app API, in-app chat WebSocket (`https://` / `wss://`) | backend `127.0.0.1:8000` |
+| `watch.example.com` | iOS / watchOS HealthKit sync (`wss://`) and its HTTP endpoints | Watch Exporter `127.0.0.1:8765` |
+| `hime.example.com` *(optional, any name)* | Web dashboard in a browser | frontend `127.0.0.1:5173` |
+
+So you need:
+
+- DNS records for `api.` and `watch.` (plus the dashboard hostname if you use it) pointing at the proxy host. A single hostname with path prefixes such as `/ingest/` does **not** work with the iOS app.
+- Inbound TCP 80 and 443 reachable on the proxy host.
+- A TLS certificate for each hostname. Both examples below use Let's Encrypt.
+
+> **Do not enter a bare IP address in the app for a public server.** A plain IPv4 address (or `*.local`) puts the app in LAN mode: it talks unencrypted `http://<ip>:8000` and `ws://<ip>:8765`, which would send your auth token and health data in cleartext over the internet.
+
+### 2.2. Set an API auth token
+
+Before you open CareAgent to the internet, set a long random bearer token in `.env`:
+
+```bash
+API_AUTH_TOKEN=$(openssl rand -hex 32)
+```
+
+With this set, the `BearerAuthMiddleware` in `backend/main.py` rejects every `/api/*` and `/ws/*` request that does not carry `Authorization: Bearer <token>`. Browser WebSocket clients can pass the token via `?token=...` in the query string. Save the same token in your iOS app settings (Settings → Auth Token).
+
+The dashboard needs no build-time configuration for this: on the first `401` it prompts for the token in the browser and keeps it in `sessionStorage` — or in `localStorage` if the user ticks **Remember on this device** — then sends it on every request and WebSocket. Do **not** set `VITE_API_AUTH_TOKEN` for a shared deployment: Vite would inline it into `dist/`, which the web server hands to every visitor.
+
+**Personalised pages and the token.** Agent-generated pages are served from `/api/personalised-pages/{id}/`, so they are behind the same token. The dashboard never puts that token in a URL for them: it fetches the page HTML with the `Authorization` header and injects the markup into a `sandbox="allow-scripts"` iframe via `srcdoc`. The page therefore runs in an opaque origin at `about:srcdoc` — no query string, no referrer, no `window.parent`, no storage, no `/api/*` — and gets its data through a validated `postMessage` bridge in the dashboard. **Open in new tab** re-opens the dashboard at `/pages?page=<id>`, not the raw API URL, so the page stays sandboxed there too. Because a `srcdoc` document receives no response headers, `page_routes.py` also emits the page Content-Security-Policy as a `<meta http-equiv>` inside the markup; both the header and the meta tag are kept in sync from `_PAGE_CSP`.
+
+### 2.3. CORS
+
+If your frontend is served from a different origin than the API (for example `app.example.com` vs `api.example.com`), set the allowed origins in `.env`:
+
+```bash
+CORS_ORIGINS='["https://app.example.com"]'
+```
+
+Use JSON array format. Example with multiple origins:
+`CORS_ORIGINS='["https://app.example.com", "https://admin.example.com"]'`.
+Leave this unset to use defaults for local development.
+
+### 2.4. Example: nginx
+
+```nginx
+# Shared WebSocket upgrade handling
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# iOS app API + in-app chat WebSocket
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    client_max_body_size 20m;   # chat image uploads
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        $connection_upgrade;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+
+# Watch Exporter — HealthKit sync from iPhone / Apple Watch
+server {
+    listen 443 ssl http2;
+    server_name watch.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/watch.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/watch.example.com/privkey.pem;
+
+    client_max_body_size 50m;   # large HealthKit backfills
+
+    location / {
+        proxy_pass         http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        $connection_upgrade;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+
+# Web dashboard (optional)
+server {
+    listen 443 ssl http2;
+    server_name hime.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/hime.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hime.example.com/privkey.pem;
+
+    location / {
+        proxy_pass         http://127.0.0.1:5173;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        $connection_upgrade;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+
+server {
+    listen 80;
+    server_name api.example.com watch.example.com hime.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+Obtain the certificates with certbot:
+
+```bash
+sudo certbot --nginx -d api.example.com -d watch.example.com -d hime.example.com
+```
+
+The dashboard on port 5173 forwards `/api/` to the backend itself (nginx in the Docker image, the Vite proxy in native mode), so it only needs the single proxy block above. In native mode (`./hime.sh start`) also add the dashboard hostname to `VITE_ALLOWED_HOSTS` in `frontend/.env.local`, otherwise Vite rejects the request.
+
+### 2.5. Example: Caddy
+
+Caddy handles TLS automatically via Let's Encrypt, including WebSocket upgrades:
+
+```caddy
+api.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+}
+
+watch.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
+
+# Web dashboard (optional)
+hime.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:5173
+}
+```
+
+Run `sudo caddy reload` after editing `/etc/caddy/Caddyfile`. Caddy will negotiate a certificate for each hostname on first request and renew them automatically.
+
+### 2.6. Firewall and port binding
+
+Only 80 and 443 should be reachable from the internet. Ports 8000, 8765, and 5173 must not be.
+
+The default `docker-compose.yml` publishes those three ports on **all** interfaces (`"8000:8000"` etc.), and Docker's published ports bypass `ufw`/`firewalld` rules on many distributions. On a VPS, rebind them to loopback so only the reverse proxy on the same host can reach them — for example in a `docker-compose.override.yml`:
+
+```yaml
+services:
+  backend:
+    ports: !override
+      - "127.0.0.1:8000:8000"
+  frontend:
+    ports: !override
+      - "127.0.0.1:5173:5173"
+  watch:
+    ports: !override
+      - "127.0.0.1:8765:8765"
+```
+
+(`!override` needs Docker Compose v2.24+.) If the reverse proxy runs on a different machine, keep the ports on a private network interface instead and firewall them from the public side.
+
+### 2.7. Configure the iOS app
+
+In the app's Settings, enter the **bare domain** (`example.com`, no scheme, no subdomain) as the server address, and paste the same `API_AUTH_TOKEN` into **Auth Token**. The app will then use `https://api.example.com` and `wss://watch.example.com`.
+
+---
+
+## 3. Messaging gateway deployment notes
+
+### 3.1. Telegram
+
+Telegram supports two delivery modes:
+
+- **Long polling (default)**: the backend opens an outbound HTTPS connection to `api.telegram.org` and fetches updates. **No public endpoint is required.** This is the correct choice for LAN-only or home-server deployments. It also works behind any NAT or tunnel.
+- **Webhook**: Telegram pushes updates to a public HTTPS URL that you control. Requires a valid TLS certificate on a publicly reachable domain. Use this only if you are already running CareAgent behind the reverse proxy described in section 2.
+
+CareAgent uses long polling by default. Unless you specifically need webhooks, leave it alone.
+
+### 3.2. Feishu (Lark)
+
+Feishu supports two transports for receiving events, selected via `FEISHU_TRANSPORT`:
+
+- `ws` — long-lived WebSocket connection opened by the backend to Feishu. **No public endpoint is required.** Strongly recommended for personal deployments.
+- `webhook` — Feishu posts events to a public HTTPS URL (typically `https://hime.example.com/api/feishu/webhook`). Requires the reverse-proxy setup from section 2 and the `FEISHU_VERIFICATION_TOKEN` from the Feishu developer console.
+
+Note that the **Message Card Request URL** (used by the "Show Evidence" button) is always an HTTP callback even when the message transport is WebSocket. If you have no public URL, card actions will not work, but text chat will still function over WebSocket.
+
+### 3.3. WeChat (Weixin ClawBot)
+
+WeChat goes over Tencent's iLink protocol (`ilinkai.weixin.qq.com`) and is intentionally simple:
+
+- **No public endpoint required.** The backend opens an outbound long-poll to iLink — works behind any NAT or tunnel.
+- **No developer-console setup.** Authentication is one QR scan from the operator's personal WeChat (Settings → Plugins → ClawBot). The resulting `bot_token` is persisted to `./data/weixin_bot_token.json` and reused on every restart.
+- **Text-only on the message path** in this release. Image / file / audio / video items are skipped on inbound, and `send_photo` degrades to sending the caption. Adding the AES-128-ECB CDN handshake for media is on the roadmap.
+- **Outbound replies are session-bound.** iLink rejects messages without a `context_token` from a recent inbound, so autonomous pushes only succeed after the user has messaged the bot at least once. The poller caches the latest token per user automatically.
+
+For setup, see [`docs/INSTALL.md#wechat-weixin-clawbot`](INSTALL.md#wechat-weixin-clawbot).
+
+### 3.4. In-app iOS channel
+
+The native iOS chat path does **not** require a public inbound URL. The phone initiates:
+
+- `POST /api/agent/chat` (and optional image upload when `IOS_VISION_ENABLED=true`)
+- `WS /api/stream/agent/LiveUser?client=ios` for live downlink events
+
+Behind your reverse proxy, ensure WebSocket upgrade headers are forwarded (same `location /` block as in section 2.4). Pass `API_AUTH_TOKEN` via `Authorization: Bearer` on HTTP and `?token=` on the WebSocket if auth is enabled.
+
+**APNs (optional):** mount the `.p8` key into the backend container read-only and set `APNS_*` in `.env`. Each device token is pushed through the APNs environment the app registered it with (`sandbox` for Xcode debug, `production` for TestFlight/App Store), so debug and store builds both work against one server; `APNS_ENV` is only the fallback for tokens without one. Device tokens are stored in the memory DB via `POST /api/devices/register`.
+
+**Event fan-out:** multiple WebSocket clients (iOS app + web agent monitor) subscribe through `EventHub` in `backend/api/event_hub.py`. The iOS client uses `replay=false` on subscribe so reconnects do not duplicate bubbles; the dashboard keeps replay for late joins.
+
+---
+
+## 4. Docker Compose production notes
+
+The repository ships with a `docker-compose.yml` that runs the backend, frontend, and Watch Exporter as three services. For production use:
+
+1. **Mount persistent volumes** for `./data`, `./memory`, `./logs`, and `./prompts`. These are already declared in the compose file; do not remove them, or you will lose agent memory on every restart.
+2. **Do not expose service ports directly**. Place the compose stack on an internal Docker network and put your reverse proxy (nginx, Caddy, or Traefik) in front, either as another compose service or on the host.
+3. **Pin image tags** in any fork you build, rather than `:latest`, so that redeploys are reproducible.
+4. **Set `API_AUTH_TOKEN` and any LLM API keys via `.env`**, not as literals in the compose file — the compose file reads from `.env` automatically.
+5. **Run behind a process supervisor** if you are not using Docker's own restart policy. The `restart: unless-stopped` directive is usually enough.
+
+### 4.1. Health checks
+
+Compose services expose the same endpoints described in section 1.5. Point your orchestrator at:
+
+- `GET http://backend:8000/health` — backend liveness
+- `GET http://watch:8765/ping` — watch exporter liveness
+
+---
+
+## 5. Upgrades and backups
+
+- **Backups**: the only irreplaceable state lives in `data/`, `memory/`, and `prompts/`. Back these up with your normal tooling (rsync, restic, borg). Health samples are refreshed from HealthKit on every iOS app launch, so losing `data/` is recoverable; losing `memory/` destroys the agent's learned history.
+- **Upgrades**: `git pull && ./hime.sh restart --clean`. The `--clean` flag clears Python and node caches without touching `data/` or `memory/`.
+- **Rollback**: because state lives in SQLite files with stable schemas, rolling back to a previous commit usually works without migrations. Any schema-migration steps will be called out in the release notes of the relevant GitHub release.
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| iOS app cannot reach backend | Firewall / wrong IP | Verify `curl http://<ip>:8765/ping` from another LAN device |
+| `401 Unauthorized` from frontend | `API_AUTH_TOKEN` set but the browser has no token stored | Paste the token into the dashboard's token prompt (it opens on any 401); clear site data to reset it |
+| Telegram bot silent | `TELEGRAM_ALLOWED_CHAT_IDS` empty | Add your chat ID to the allow-list |
+| Feishu card actions do nothing | Message Card Request URL not set / not publicly reachable | Configure the card callback URL in the Feishu console |
+| WeChat bot silent after restart | Token file missing or expired | Re-run `python -m backend.weixin.qr_login` and re-scan; check `./data/weixin_bot_token.json` exists |
+| Agent stops after a few minutes on a laptop | OS sleep | Use `caffeinate` (macOS) or `systemd-inhibit` (Linux), or deploy on an always-on host |
+| iOS chat works on LAN but not over HTTPS | WS URL / cert mismatch | Use `https://` in Server URL; confirm proxy forwards WebSocket upgrade |
+| No push notifications when app is closed | `APNS_ENABLED=false` or missing `.p8` | See [`docs/INSTALL.md#optional-apns-background-push`](INSTALL.md#optional-apns-background-push) |
+| Duplicate chat bubbles after reconnect | Expected if replay were on for iOS | iOS must connect with `?client=ios` (handled by the app) |
+
+For anything not covered here, see [`docs/DEVELOPMENT.md`](DEVELOPMENT.md).

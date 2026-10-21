@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+from pathlib import Path
+from typing import Any
+
+from ..prompt_loader import PROMPTS_DIR as _PROMPTS_DIR
+from .base import BaseTool
+
+logger = logging.getLogger(__name__)
+
+_FILE_CONFIG = {
+    "user.md": {
+        "marker": "<!-- Agent: append your observations below this line. -->",
+        "default_header": (
+            "# User Profile\n\n"
+            "> Written by the agent via `update_md`. Captures **stable** user\n"
+            "> preferences, habits, and communication style learned over many\n"
+            "> conversations. Not a chat log — append only durable signals.\n"
+            "<!-- Agent: append your observations below this line. -->\n"
+        ),
+    },
+    "experience.md": {
+        "marker": "<!-- Agent: append your real learnings below this line. -->",
+        "default_header": (
+            "# Experience — Agent's Own Notes\n\n"
+            "> Initially empty. Append things you have **actually learned** from\n"
+            "> running on this user's data — surprising data quirks, gotchas you\n"
+            "> hit and the workaround, schema details that aren't in\n"
+            "> `data_schema.md`, edge cases worth remembering next time.\n\n"
+            "## Default behaviour rule (applies to every user — do not edit)\n\n"
+            "**When the user expresses doubt about, disputes, or asks you to\n"
+            "re-check an answer, re-invoke the data tools and re-derive the answer\n"
+            "from fresh tool results in that same turn.** Do not just paraphrase or\n"
+            "restate the response being questioned — that response is the thing\n"
+            "under dispute. Claiming to have re-checked without an accompanying\n"
+            "`sql` / `code` / `analyze` call in the same turn is fabrication.\n"
+            "This holds even when the disputed numbers appear earlier in the chat\n"
+            "history: prior history is not evidence for the current turn when the\n"
+            "user is challenging it — only a fresh tool call is.\n\n"
+            "<!-- Agent: append your real learnings below this line. -->\n"
+        ),
+    },
+}
+
+
+def _split_header_body(existing: str, marker: str, default_header: str) -> tuple[str, str]:
+    if marker in existing:
+        header, _, body = existing.partition(marker)
+        header = header.rstrip() + "\n" + marker
+        return header, body.lstrip("\n")
+    return default_header.rstrip(), existing.strip()
+
+
+_md_lock = threading.Lock()
+
+
+def _apply_update(
+    path: Path, marker: str, default_header: str, op: str,
+    content: str | None, old_string: str | None, new_string: str | None,
+) -> dict[str, Any] | str:
+    with _md_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text("utf-8") if path.exists() else default_header
+        header, body = _split_header_body(existing, marker, default_header)
+
+        if op == "append":
+            if not content or not content.strip():
+                return {"success": False, "error": "op=append requires non-empty content."}
+            new_body = (body.rstrip() + "\n\n" + content.strip()).lstrip("\n")
+        elif op == "replace":
+            if content is None:
+                return {"success": False, "error": "op=replace requires content (use empty string to clear)."}
+            new_body = content.strip()
+        else:
+            if not old_string:
+                return {"success": False, "error": "op=edit requires old_string."}
+            if new_string is None:
+                return {"success": False, "error": "op=edit requires new_string (use empty string to delete)."}
+            if old_string not in body:
+                return {
+                    "success": False,
+                    "error": "old_string not found in editable body. Read the current content in your system prompt and pass an exact match.",
+                }
+            if body.count(old_string) > 1:
+                return {
+                    "success": False,
+                    "error": "old_string matches multiple locations. Include more surrounding context so it is unique.",
+                }
+            new_body = body.replace(old_string, new_string, 1)
+
+        new_text = header.rstrip() + "\n\n" + new_body.strip() + "\n"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new_text, "utf-8")
+        os.replace(tmp, path)
+        return new_body
+
+
+class UpdateMdTool(BaseTool):
+
+    name = "update_md"
+
+    def get_definition(self) -> dict[str, Any]:
+        return self._get_definition_from_json("update_md")
+
+    async def execute(
+        self,
+        file: str,
+        op: str = "append",
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+    ) -> dict[str, Any]:
+        file = file.strip().lower()
+        if not file.endswith(".md"):
+            file = file + ".md"
+        if file not in _FILE_CONFIG:
+            return {"success": False, "error": f"Unknown file: {file}. Use user.md or experience.md."}
+
+        op = (op or "append").strip().lower()
+        if op not in ("append", "edit", "replace"):
+            return {"success": False, "error": f"Unknown op: {op}. Use append, edit, or replace."}
+
+        try:
+            path = _PROMPTS_DIR / file
+            cfg = _FILE_CONFIG[file]
+
+            outcome = await asyncio.to_thread(
+                _apply_update, path, cfg["marker"], cfg["default_header"],
+                op, content, old_string, new_string,
+            )
+            if isinstance(outcome, dict):
+                return outcome
+            new_body = outcome
+
+            logger.info("update_md: op=%s file=%s new_body_chars=%d", op, file, len(new_body))
+            return {
+                "success": True,
+                "op": op,
+                "file": file,
+                "body_characters": len(new_body),
+            }
+
+        except Exception as exc:
+            logger.error("update_md failed (%s): %s", file, exc, exc_info=True)
+            return {"success": False, "error": str(exc)}

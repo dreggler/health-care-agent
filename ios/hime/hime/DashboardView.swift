@@ -1,0 +1,808 @@
+import SwiftUI
+import Charts
+
+
+struct DashboardView: View {
+    @StateObject private var viewModel = DashboardViewModel.shared
+    @StateObject private var tasksVM = TasksViewModel()
+    @ObservedObject private var router = AppRouter.shared
+    @State private var hasStarted = false
+    @State private var selectedSection = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+
+            Picker("Section", selection: $selectedSection) {
+                Text("Overview").tag(0)
+                Text("Reports").tag(1)
+                Text("Tasks").tag(2)
+            }
+            .pickerStyle(.segmented)
+
+
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 16) {
+                        switch selectedSection {
+                        case 0:
+                            AgentStatusCard(viewModel: viewModel)
+                            HealthChartSection(viewModel: viewModel)
+                        case 1:
+                            ReportsListSection(viewModel: viewModel,
+                                               expandTargetId: router.pendingReportId)
+                        case 2:
+                            TasksContentView(vm: tasksVM)
+                        default:
+                            EmptyView()
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                }
+
+
+                .onReceive(router.$pendingReportId) { id in
+                    guard let id else { return }
+                    selectedSection = 1
+
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        withAnimation { proxy.scrollTo("report-\(id)", anchor: .top) }
+                    }
+                }
+            }
+        }
+        .background(HimeColor.paper)
+        .onAppear {
+            if !hasStarted {
+                hasStarted = true
+            }
+            viewModel.startRefreshing()
+            tasksVM.startPolling()
+        }
+        .onDisappear {
+            viewModel.stopRefreshing()
+            tasksVM.stopPolling()
+        }
+        .refreshable {
+            HealthKitManager.shared.forceFetch()
+
+
+            async let overview: () = viewModel.refreshAll()
+            async let tasks: () = tasksVM.fetchTasks()
+            async let rules: () = tasksVM.fetchRules()
+            _ = await (overview, tasks, rules)
+        }
+    }
+}
+
+
+private struct AgentStatusCard: View {
+    @ObservedObject var viewModel: DashboardViewModel
+
+    private var stateIcon: String {
+        let s = viewModel.analysisState.lowercased()
+        if s.contains("think") { return "brain" }
+        if s.contains("execut") { return "gearshape.fill" }
+        if s.contains("sleep") { return "moon.zzz.fill" }
+        if s.contains("quick") { return "bolt.fill" }
+        if s == "idle" { return "pause.circle" }
+        return "circle.fill"
+    }
+
+    private var stateColor: Color {
+        let s = viewModel.analysisState.lowercased()
+        if s.contains("think") { return HimeColor.accentStrong }
+        if s.contains("execut") { return HimeColor.warn }
+        if s.contains("sleep") { return HimeColor.sky }
+        if s.contains("quick") { return HimeColor.rose }
+        if s.hasPrefix("chat") { return HimeColor.ok }
+        return HimeColor.ink2
+    }
+
+
+    private var stateLabel: String {
+        let s = viewModel.analysisState.lowercased()
+        if s == "idle" || s.isEmpty { return String(localized: "Idle") }
+        if s == "initialized" { return String(localized: "Starting up") }
+        if s.contains("quick") { return String(localized: "Quick check") }
+        if s.hasPrefix("chat") { return String(localized: "Chatting") }
+        if s.contains("think") { return String(localized: "Thinking") }
+        if s.contains("execut") || s.contains("analy") { return String(localized: "Working") }
+        if s.contains("sleep") { return String(localized: "Sleeping") }
+        return viewModel.analysisState.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+
+    private func formatRecords(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+
+    private func formatTokens(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
+        return "\(n)"
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: viewModel.isAgentRunning ? "brain.fill" : "brain")
+                    .font(.title2)
+                    .foregroundColor(viewModel.isAgentRunning ? HimeColor.ok : HimeColor.ink2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent")
+                        .font(.headline)
+                    Text(viewModel.agentModel ?? String(localized: "Not configured"))
+                        .font(.caption)
+                        .foregroundColor(HimeColor.ink2)
+                }
+                Spacer()
+
+                HStack(spacing: 4) {
+                    Image(systemName: stateIcon)
+                        .font(.caption2)
+                    Text(stateLabel)
+                        .font(.caption2.weight(.medium))
+                }
+                .foregroundColor(stateColor)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(stateColor.opacity(0.1))
+                .clipShape(Capsule())
+            }
+
+
+            HStack(spacing: 0) {
+                StatCell(label: "Cycles", value: "\(viewModel.analysisCycles)")
+                Divider().frame(height: 28)
+                StatCell(label: "Records", value: formatRecords(viewModel.totalRecords))
+                Divider().frame(height: 28)
+                StatCell(label: "Last Analysis",
+                         value: viewModel.lastAnalysisTime != nil ? formatRelativeTime(viewModel.lastAnalysisTime!) : "Never")
+            }
+            .padding(.vertical, 4)
+
+
+            if viewModel.promptTokens + viewModel.completionTokens > 0 {
+                HStack(spacing: 0) {
+                    TokenCell(label: "Input", value: formatTokens(viewModel.promptTokens), color: HimeColor.accentStrong)
+                    TokenCell(label: "Thinking", value: formatTokens(viewModel.thoughtsTokens), color: HimeColor.rose)
+                    TokenCell(label: "Output", value: formatTokens(viewModel.completionTokens), color: HimeColor.ok)
+                }
+                .padding(.vertical, 4)
+                .background(HimeColor.paper)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .padding(12)
+        .background(HimeColor.card)
+        .clipShape(RoundedRectangle(cornerRadius: HimeRadius.card, style: .continuous))
+    }
+
+    private func formatRelativeTime(_ iso: String) -> String {
+
+        let hasTZ = iso.hasSuffix("Z") || iso.contains("+") || (iso.count > 19 && iso.dropFirst(19).contains("-"))
+        let utcIso = hasTZ ? iso : iso + "Z"
+        let f1 = ISO8601DateFormatter()
+        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        guard let date = f1.date(from: utcIso) ?? f2.date(from: utcIso) else {
+            return "—"
+        }
+
+        let now = Date()
+        let seconds = Int(now.timeIntervalSince(date))
+
+        if seconds < 60        { return "just now" }
+        if seconds < 3600      { return "\(seconds / 60)m ago" }
+        if seconds < 86400     { return "\(seconds / 3600)h ago" }
+        if seconds < 86400 * 7 { return "\(seconds / 86400)d ago" }
+
+        let df = DateFormatter()
+
+
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "M/d HH:mm"
+        return df.string(from: date)
+    }
+}
+
+private struct StatCell: View {
+    let label: LocalizedStringKey
+    let value: String
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.system(.subheadline, design: .rounded).weight(.semibold).monospacedDigit())
+                .foregroundColor(HimeColor.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(HimeColor.ink2)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct TokenCell: View {
+    let label: LocalizedStringKey
+    let value: String
+    let color: Color
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.system(.footnote, design: .rounded).weight(.semibold).monospacedDigit())
+                .foregroundColor(color)
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(HimeColor.ink2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+
+private struct HealthChartSection: View {
+    @ObservedObject var viewModel: DashboardViewModel
+    @State private var expandedMetricId: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Health Summary")
+                .font(.headline)
+                .foregroundColor(HimeColor.ink)
+
+            let hasAnyData = viewModel.metricCategories.contains { !$0.series.isEmpty }
+
+            if !hasAnyData && !viewModel.isLoadingMetrics {
+                EmptyMetricsView()
+            } else {
+                ForEach(viewModel.metricCategories) { categoryData in
+                    MetricCategorySection(
+                        categoryData: categoryData,
+                        expandedMetricId: $expandedMetricId
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct EmptyMetricsView: View {
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "heart.text.square")
+                .font(.system(size: 32))
+                .foregroundColor(HimeColor.ink2.opacity(0.5))
+            Text("Waiting for data...")
+                .font(.subheadline)
+                .foregroundColor(HimeColor.ink2)
+            Text("Wear your Apple Watch and sync data to see metrics here.")
+                .font(.caption)
+                .foregroundColor(HimeColor.ink2)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
+    }
+}
+
+
+private struct MetricCategorySection: View {
+    let categoryData: MetricCategoryData
+    @Binding var expandedMetricId: String?
+
+    private var categoryColor: Color {
+        switch categoryData.category.color {
+        case "amber":  return HimeColor.accent
+        case "orange": return .orange
+        case "red":    return .red
+        case "indigo": return .indigo
+        case "teal":   return .teal
+        case "yellow": return .yellow
+        case "purple": return .purple
+        case "green":  return .green
+        case "cyan":   return .cyan
+        default:       return .gray
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+
+            HStack(spacing: 6) {
+                Image(systemName: categoryData.category.icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(categoryColor)
+
+                Text(categoryData.category.rawValue)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(HimeColor.ink)
+
+                Spacer()
+
+                if categoryData.series.isEmpty {
+                    Text("No data")
+                        .font(.caption2)
+                        .foregroundColor(HimeColor.ink2)
+                }
+            }
+
+            if categoryData.series.isEmpty {
+                HStack {
+                    Spacer()
+                    VStack(spacing: 4) {
+                        Image(systemName: "chart.line.downtrend.xyaxis")
+                            .font(.system(size: 20))
+                            .foregroundColor(HimeColor.ink2.opacity(0.5))
+                        Text("No data yet")
+                            .font(.caption2)
+                            .foregroundColor(HimeColor.ink2.opacity(0.5))
+                    }
+                    .padding(.vertical, 12)
+                    Spacer()
+                }
+            } else {
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                    ForEach(categoryData.series) { series in
+                        SmallMetricCard(
+                            series: series,
+                            category: categoryData.category,
+                            accentColor: categoryColor,
+                            isExpanded: expandedMetricId == series.id
+                        )
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                if expandedMetricId == series.id {
+                                    expandedMetricId = nil
+                                } else {
+                                    expandedMetricId = series.id
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+                if let expandedSeries = categoryData.series.first(where: { $0.id == expandedMetricId }) {
+                    MetricChartCard(
+                        series: expandedSeries,
+                        category: categoryData.category,
+                        accentColor: categoryColor
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+        }
+        .padding(12)
+        .background(HimeColor.card)
+        .clipShape(RoundedRectangle(cornerRadius: HimeRadius.card, style: .continuous))
+    }
+}
+
+
+private struct SmallMetricCard: View {
+    let series: MetricSeries
+    let category: MetricCategory
+    let accentColor: Color
+    let isExpanded: Bool
+
+    private var trendColor: Color {
+        switch series.trend.color {
+        case "green": return HimeColor.ok
+        case "red":   return HimeColor.bad
+        case "blue":  return HimeColor.sky
+        default:      return HimeColor.ink2
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(series.displayName)
+                .font(.caption2.weight(.medium))
+                .foregroundColor(HimeColor.ink2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+
+            if let latestRaw = series.latestValue {
+                HStack(spacing: 2) {
+                    Text(category.formatValue(latestRaw, key: series.feature))
+                        .font(.system(.callout, design: .rounded).weight(.bold).monospacedDigit())
+                        .foregroundColor(HimeColor.ink)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+
+                    if !series.unit.isEmpty {
+                        Text(series.unit)
+                            .font(.caption2)
+                            .foregroundColor(HimeColor.ink2)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                }
+
+                Image(systemName: series.trend.icon)
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(trendColor)
+            } else {
+                Text("--")
+                    .font(.system(.callout, design: .rounded).weight(.bold))
+                    .foregroundColor(HimeColor.ink2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(isExpanded ? accentColor.opacity(0.1) : HimeColor.paper)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(isExpanded ? accentColor.opacity(0.4) : Color.clear, lineWidth: 1.5)
+        )
+    }
+}
+
+
+private struct MetricChartCard: View {
+    let series: MetricSeries
+    let category: MetricCategory
+    let accentColor: Color
+
+    private var trendColor: Color {
+        switch series.trend.color {
+        case "green": return HimeColor.ok
+        case "red":   return HimeColor.bad
+        case "blue":  return HimeColor.sky
+        default:      return HimeColor.ink2
+        }
+    }
+
+    private var dataSpanHours: Double {
+        guard let first = series.dataPoints.first?.date,
+              let last = series.dataPoints.last?.date else { return 0 }
+        return last.timeIntervalSince(first) / 3600.0
+    }
+
+    private var xTickCount: Int {
+        if dataSpanHours > 168 { return 4 }
+        if dataSpanHours > 48 { return 5 }
+        if dataSpanHours > 24 { return 3 }
+        return 4
+    }
+
+    private var xAxisFormat: Date.FormatStyle {
+        if series.chartStyle == .bar && dataSpanHours > 48 {
+
+            return .dateTime.month(.abbreviated).day(.defaultDigits)
+        }
+        if dataSpanHours > 168 {
+            return .dateTime.month(.abbreviated).day(.defaultDigits)
+        } else if dataSpanHours > 48 {
+            return .dateTime.weekday(.abbreviated).day(.defaultDigits)
+        } else if dataSpanHours > 24 {
+            return .dateTime.weekday(.abbreviated).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+        } else {
+            return .dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+        }
+    }
+
+
+    private var yDomain: ClosedRange<Double> {
+        let values = series.dataPoints.map(\.value)
+        guard let dMin = values.min(), let dMax = values.max() else { return 0...1 }
+        let (lo, hi) = series.yAxisConfig.resolve(dataMin: dMin, dataMax: dMax)
+        return lo...hi
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+
+            HStack(spacing: 6) {
+                Text(series.displayName)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(HimeColor.ink)
+
+                Spacer()
+
+                if let latestRaw = series.latestValue {
+                    Text(category.formatValue(latestRaw, key: series.feature))
+                        .font(.system(.subheadline, design: .rounded).weight(.semibold).monospacedDigit())
+                        .foregroundColor(HimeColor.ink)
+
+                    if !series.unit.isEmpty {
+                        Text(series.unit)
+                            .font(.caption2)
+                            .foregroundColor(HimeColor.ink2)
+                    }
+
+                    Image(systemName: series.trend.icon)
+                        .font(.caption2.weight(.bold))
+                        .foregroundColor(trendColor)
+                }
+            }
+
+
+            if series.chartStyle == .sleepBar && !series.sleepBlocks.isEmpty {
+                SleepStageTimeline(blocks: series.sleepBlocks)
+            }
+
+            else if series.dataPoints.count >= 2 || (series.chartStyle == .bar && !series.dataPoints.isEmpty) {
+                chartContent
+                    .frame(height: 140)
+            } else if series.dataPoints.count == 1 {
+                HStack {
+                    Spacer()
+                    Text("1 data point recorded")
+                        .font(.caption2)
+                        .foregroundColor(HimeColor.ink2)
+                    Spacer()
+                }
+                .frame(height: 30)
+            }
+        }
+        .padding(10)
+        .background(HimeColor.paper)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var chartContent: some View {
+        let yLabel = series.unit.isEmpty ? "Value" : series.unit
+
+        Chart(series.dataPoints) { point in
+            if series.chartStyle == .bar {
+                BarMark(
+                    x: .value("Time", point.date, unit: .day),
+                    y: .value(yLabel, point.value)
+                )
+                .foregroundStyle(accentColor.gradient)
+                .cornerRadius(3)
+            } else if series.chartStyle == .point {
+                PointMark(
+                    x: .value("Time", point.date),
+                    y: .value(yLabel, point.value)
+                )
+                .foregroundStyle(accentColor)
+                .symbolSize(20)
+            } else {
+                LineMark(
+                    x: .value("Time", point.date),
+                    y: .value(yLabel, point.value)
+                )
+                .foregroundStyle(accentColor.gradient)
+                .lineStyle(StrokeStyle(lineWidth: 1.5))
+
+                AreaMark(
+                    x: .value("Time", point.date),
+                    y: .value(yLabel, point.value)
+                )
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [accentColor.opacity(0.2), accentColor.opacity(0.02)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+            }
+        }
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: xTickCount)) { _ in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.3))
+                    .foregroundStyle(HimeColor.line)
+                AxisValueLabel(format: xAxisFormat)
+                    .font(.caption2)
+                    .foregroundStyle(HimeColor.ink2)
+            }
+        }
+        .chartYAxis {
+            AxisMarks(values: .automatic(desiredCount: 4)) { _ in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.3))
+                    .foregroundStyle(HimeColor.line)
+                AxisValueLabel()
+                    .font(.caption2)
+                    .foregroundStyle(HimeColor.ink2)
+            }
+        }
+        .chartYScale(domain: yDomain)
+    }
+}
+
+
+private struct SleepStageTimeline: View {
+    let blocks: [SleepBlock]
+
+    nonisolated private static func stageColor(_ stage: SleepStage) -> Color {
+        switch stage {
+        case .deep:  return Color(red: 0.25, green: 0.15, blue: 0.65)
+        case .core:  return Color(red: 0.40, green: 0.55, blue: 0.95)
+        case .rem:   return Color(red: 0.30, green: 0.80, blue: 0.85)
+        case .awake: return Color(red: 0.95, green: 0.60, blue: 0.25)
+        case .inBed: return Color(white: 0.30)
+        }
+    }
+
+
+    private var nights: [(date: Date, blocks: [SleepBlock])] {
+        let calendar = Calendar.current
+        var grouped: [Date: [SleepBlock]] = [:]
+
+        for block in blocks where block.stage != .inBed {
+
+            let endDate = block.start.addingTimeInterval(block.durationMinutes * 60)
+            let day = calendar.startOfDay(for: endDate)
+            grouped[day, default: []].append(block)
+        }
+
+        return grouped.sorted { $0.key > $1.key }
+            .prefix(3)
+            .map { (date: $0.key, blocks: $0.value.sorted { $0.start < $1.start }) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(Array(nights.enumerated()), id: \.offset) { _, night in
+                NightBarView(night: night, stageColor: Self.stageColor)
+            }
+
+
+            HStack(spacing: 10) {
+                ForEach([SleepStage.deep, .core, .rem, .awake], id: \.rawValue) { stage in
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 2.5)
+                            .fill(Self.stageColor(stage))
+                            .frame(width: 12, height: 12)
+                        Text(stage.rawValue)
+                            .font(.caption2)
+                            .foregroundColor(HimeColor.ink2)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 2)
+        }
+    }
+}
+
+
+private struct NightBarView: View {
+    let night: (date: Date, blocks: [SleepBlock])
+    let stageColor: (SleepStage) -> Color
+
+    private var nightLabel: String {
+        let formatter = DateFormatter()
+
+
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "E, MMM d"
+        return formatter.string(from: night.date)
+    }
+
+    private var sleepBlocks: [SleepBlock] {
+        night.blocks.filter { $0.stage != .inBed }
+    }
+
+
+    private var sessions: [[SleepBlock]] {
+        let sorted = sleepBlocks.sorted { $0.start < $1.start }
+        guard !sorted.isEmpty else { return [] }
+        var result: [[SleepBlock]] = [[sorted[0]]]
+        for i in 1..<sorted.count {
+            let prevEnd = result[result.count - 1].last!.start.addingTimeInterval(
+                result[result.count - 1].last!.durationMinutes * 60
+            )
+            if sorted[i].start.timeIntervalSince(prevEnd) > 7200 {
+                result.append([sorted[i]])
+            } else {
+                result[result.count - 1].append(sorted[i])
+            }
+        }
+        return result
+    }
+
+    private var totalSleepMinutes: Int {
+        Int(sleepBlocks.filter { $0.stage != .awake }.reduce(0) { $0 + $1.durationMinutes })
+    }
+
+
+    private var timeRangeLabel: String {
+        let fmt = DateFormatter()
+
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "HH:mm"
+        let parts = sessions.compactMap { session -> String? in
+            guard let first = session.first, let last = session.last else { return nil }
+            let end = last.start.addingTimeInterval(last.durationMinutes * 60)
+            return "\(fmt.string(from: first.start))–\(fmt.string(from: end))"
+        }
+        return parts.joined(separator: "  +  ")
+    }
+
+
+    private var totalFilledMinutes: Double {
+        sleepBlocks.reduce(0) { $0 + $1.durationMinutes }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(nightLabel)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(HimeColor.ink)
+                Spacer()
+                let h = totalSleepMinutes / 60
+                let m = totalSleepMinutes % 60
+                Text("\(h)h \(m)m")
+                    .font(.system(.caption, design: .rounded).weight(.bold).monospacedDigit())
+                    .foregroundColor(HimeColor.ink)
+            }
+
+            Text(timeRangeLabel)
+                .font(.caption2)
+                .foregroundColor(HimeColor.ink2)
+
+
+            GeometryReader { geo in
+                let sess = sessions
+                let sessionGapWidth: CGFloat = sess.count > 1 ? 3 : 0
+                let totalGaps = CGFloat(max(sess.count - 1, 0)) * sessionGapWidth
+                let barWidth = geo.size.width - totalGaps
+                let total = max(totalFilledMinutes, 1)
+
+                HStack(spacing: sessionGapWidth) {
+                    ForEach(Array(sess.enumerated()), id: \.offset) { _, session in
+                        let sessionDur = session.reduce(0.0) { $0 + $1.durationMinutes }
+                        let sessionWidth = (sessionDur / total) * barWidth
+                        HStack(spacing: 0.5) {
+                            ForEach(session) { block in
+                                let w = max((block.durationMinutes / sessionDur) * sessionWidth, 1.5)
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(stageColor(block.stage))
+                                    .frame(width: w)
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+            }
+            .frame(height: 22)
+
+
+            HStack(spacing: 8) {
+                ForEach(stageSummary(), id: \.0) { stage, mins in
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(stageColor(stage))
+                            .frame(width: 6, height: 6)
+                        Text("\(stage.rawValue) \(mins)m")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(HimeColor.ink2)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stageSummary() -> [(SleepStage, Int)] {
+        var totals: [SleepStage: Double] = [:]
+        for b in sleepBlocks where b.stage != .inBed {
+            totals[b.stage, default: 0] += b.durationMinutes
+        }
+        return [SleepStage.deep, .core, .rem, .awake].compactMap { stage in
+            guard let mins = totals[stage], mins > 0 else { return nil }
+            return (stage, Int(mins))
+        }
+    }
+}

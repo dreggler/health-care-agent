@@ -1,0 +1,541 @@
+import { useState, useEffect, useRef, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import { api } from '../lib/api.js'
+import {
+  Save,
+  RefreshCw,
+  CheckCircle2,
+  AlertCircle,
+  Sparkles,
+  Plus,
+  Trash2,
+  BookOpen,
+  Search,
+  Eye,
+  EyeOff,
+  CheckSquare,
+  Square,
+} from 'lucide-react'
+import Skeleton from '../components/Skeleton'
+
+const NAME_RE = /^[a-z0-9_-]+$/
+
+export default function Skills() {
+  const { t } = useTranslation()
+  const [skills, setSkills] = useState([])
+  const [selectedName, setSelectedName] = useState(null)
+  const selectedNameRef = useRef(selectedName)
+  const persistQueueRef = useRef(Promise.resolve())
+
+  const [editorName, setEditorName] = useState('')
+  const [editorDescription, setEditorDescription] = useState('')
+  const [editorBody, setEditorBody] = useState('')
+  const [isNew, setIsNew] = useState(false)
+
+  const [search, setSearch] = useState('')
+  const [filterMode, setFilterMode] = useState('all')
+
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [status, setStatus] = useState(null)
+
+  const [baseline, setBaseline] = useState({ name: '', description: '', body: '' })
+  const loadSeqRef = useRef(0)
+  const statusTimerRef = useRef(null)
+
+  useEffect(() => {
+    selectedNameRef.current = selectedName
+  }, [selectedName])
+
+  useEffect(() => () => {
+    if (statusTimerRef.current) clearTimeout(statusTimerRef.current)
+  }, [])
+
+  const flashSuccess = (message) => {
+    if (statusTimerRef.current) clearTimeout(statusTimerRef.current)
+    setStatus({ type: 'success', message })
+    statusTimerRef.current = setTimeout(() => {
+      statusTimerRef.current = null
+      setStatus(null)
+    }, 2500)
+  }
+
+  const hasUnsavedEdits = () => {
+    if (!(isNew || selectedName !== null)) return false
+    return (
+      editorDescription !== baseline.description ||
+      editorBody !== baseline.body ||
+      (isNew && editorName !== baseline.name)
+    )
+  }
+
+  const loadSkills = async () => {
+    setLoading(true)
+    try {
+      const res = await api.listSkills()
+      if (res.success) {
+        setSkills(res.skills || [])
+      } else {
+        setStatus({ type: 'error', message: res.error || t('skills.failed_list_skills') })
+      }
+    } catch (err) {
+      setStatus({ type: 'error', message: err.message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadSkill = async (name) => {
+    if (name === selectedName && !isNew) return
+    if (hasUnsavedEdits() && !window.confirm(t('skills.confirm_discard'))) return
+    const seq = ++loadSeqRef.current
+    setIsNew(false)
+    setSelectedName(name)
+    const res = await api.fetchSkill(name)
+    if (seq !== loadSeqRef.current) return
+    if (res.success) {
+      setEditorName(res.name)
+      setEditorDescription(res.description || '')
+      setEditorBody(res.body || '')
+      setBaseline({ name: res.name, description: res.description || '', body: res.body || '' })
+      setStatus(null)
+    } else {
+      setStatus({ type: 'error', message: res.error || t('skills.failed_load_named', { name }) })
+    }
+  }
+
+  useEffect(() => {
+    loadSkills()
+  }, [])
+
+  const handleNew = () => {
+    if (hasUnsavedEdits() && !window.confirm(t('skills.confirm_discard'))) return
+    loadSeqRef.current += 1
+    const template = '# New analysis playbook\n\n1. ...\n'
+    setIsNew(true)
+    setSelectedName(null)
+    setEditorName('')
+    setEditorDescription('')
+    setEditorBody(template)
+    setBaseline({ name: '', description: '', body: template })
+    setStatus(null)
+  }
+
+  const handleSave = async () => {
+    if (saving) return
+    if (!editorDescription.trim()) {
+      setStatus({ type: 'error', message: t('skills.description_required') })
+      return
+    }
+    setSaving(true)
+    setStatus(null)
+    try {
+      let res
+      if (isNew) {
+        if (!NAME_RE.test(editorName)) {
+          setStatus({
+            type: 'error',
+            message: t('skills.invalid_name'),
+          })
+          setSaving(false)
+          return
+        }
+        res = await api.createSkill(editorName, editorDescription, editorBody)
+      } else {
+        res = await api.updateSkill(editorName, editorDescription, editorBody)
+      }
+      if (res.success) {
+        flashSuccess(t('skills.saved'))
+        setIsNew(false)
+        setSelectedName(editorName)
+        setBaseline({ name: editorName, description: editorDescription, body: editorBody })
+        await loadSkills()
+      } else {
+        setStatus({ type: 'error', message: res.error || t('skills.save_failed') })
+      }
+    } catch (err) {
+      setStatus({ type: 'error', message: err.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (isNew || !editorName) return
+    if (!window.confirm(t('skills.confirm_delete', { name: editorName }))) return
+    setSaving(true)
+    setStatus(null)
+    try {
+      const res = await api.deleteSkill(editorName)
+      if (res.success) {
+        flashSuccess(t('skills.deleted'))
+        loadSeqRef.current += 1
+        setEditorName('')
+        setEditorDescription('')
+        setEditorBody('')
+        setBaseline({ name: '', description: '', body: '' })
+        setSelectedName(null)
+        await loadSkills()
+      } else {
+        setStatus({ type: 'error', message: res.error || t('skills.delete_failed') })
+      }
+    } catch (err) {
+      setStatus({ type: 'error', message: err.message })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+
+  const persistDisabledSet = (nextSkills) => {
+    const disabled = nextSkills.filter((s) => !s.enabled).map((s) => s.name)
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const res = await api.setSkillState(disabled)
+        if (!res.success) {
+          setStatus({ type: 'error', message: res.error || t('skills.failed_update_visibility') })
+          await loadSkills()
+        }
+      } catch (err) {
+        setStatus({ type: 'error', message: err.message })
+        await loadSkills()
+      }
+    })
+    persistQueueRef.current = run.catch(() => {})
+    return run
+  }
+
+  const toggleSkill = async (name) => {
+    const next = skills.map((s) =>
+      s.name === name ? { ...s, enabled: !s.enabled } : s,
+    )
+    setSkills(next)
+    await persistDisabledSet(next)
+  }
+
+  const setVisibilityForList = async (names, enabled) => {
+    const target = new Set(names)
+    const next = skills.map((s) => (target.has(s.name) ? { ...s, enabled } : s))
+    setSkills(next)
+    await persistDisabledSet(next)
+  }
+
+
+  const filteredSkills = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    return skills.filter((s) => {
+      if (filterMode === 'enabled' && !s.enabled) return false
+      if (filterMode === 'disabled' && s.enabled) return false
+      if (!q) return true
+      return (
+        s.name.toLowerCase().includes(q) ||
+        (s.description || '').toLowerCase().includes(q)
+      )
+    })
+  }, [skills, search, filterMode])
+
+  const enabledCount = skills.filter((s) => s.enabled).length
+  const totalCount = skills.length
+  const filteredEnabledCount = filteredSkills.filter((s) => s.enabled).length
+  const allFilteredEnabled =
+    filteredSkills.length > 0 && filteredSkills.every((s) => s.enabled)
+
+  if (loading && skills.length === 0) {
+    return <Skeleton lines={4} label={t('skills.loading')} />
+  }
+
+  const editorActive = isNew || selectedName !== null
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div>
+          <h2 className="page-title">{t('skills.title')}</h2>
+          <p className="page-subtitle max-w-2xl">
+            {t('skills.subtitle_1')}{' '}
+            <code className="text-xs bg-sunken px-1.5 py-0.5 rounded-chip">read_skill</code>.
+          </p>
+        </div>
+        <div className="flex items-center space-x-3">
+          {status && (
+            <div
+              className={`flex items-center space-x-2 px-4 py-2 rounded-full text-sm font-semibold transition-all ${
+                status.type === 'success' ? 'bg-ok/15 text-ok-ink' : 'bg-bad/15 text-bad-ink'
+              }`}
+            >
+              {status.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4" />
+              ) : (
+                <AlertCircle className="w-4 h-4" />
+              )}
+              <span>{status.message}</span>
+            </div>
+          )}
+          {editorActive && !isNew && (
+            <button
+              onClick={handleDelete}
+              disabled={saving}
+              className="btn bg-bad/10 text-bad-ink hover:bg-bad/15"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>{t('skills.delete')}</span>
+            </button>
+          )}
+          {editorActive && (
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="btn-primary"
+            >
+              {saving ? (
+                <RefreshCw className="w-5 h-5 animate-spin" />
+              ) : (
+                <Save className="w-5 h-5" />
+              )}
+              <span>{t('skills.save')}</span>
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <div className="lg:col-span-5 xl:col-span-4 space-y-3">
+          <div className="card p-4 bg-gradient-to-br from-primary-50 to-panel border-primary-200/60">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <div className="text-2xl font-bold text-ink">
+                  {enabledCount}
+                  <span className="text-base font-bold text-ink-3">/{totalCount}</span>
+                </div>
+                <div className="text-xs font-semibold text-ink-2 uppercase tracking-wider">
+                  {t('skills.visible_to_agent')}
+                </div>
+              </div>
+              <button
+                onClick={handleNew}
+                className="btn-primary !px-3 !py-1.5 text-xs"
+              >
+                <Plus className="w-3.5 h-3.5" /> {t('skills.new_button')}
+              </button>
+            </div>
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-ink-3" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t('skills.search_placeholder')}
+                aria-label={t('skills.search_placeholder')}
+                className="w-full pl-9 pr-3 py-2 text-sm border border-line rounded-control focus:ring-2 focus:ring-primary-200 focus:border-primary-400 bg-panel"
+              />
+            </div>
+            <div className="flex items-center justify-between mt-3 gap-2">
+              <div className="flex bg-panel rounded-control border border-line p-0.5 text-xs">
+                {[
+                  { k: 'all', label: t('skills.filter_all') },
+                  { k: 'enabled', label: t('skills.filter_visible') },
+                  { k: 'disabled', label: t('skills.filter_hidden') },
+                ].map((opt) => (
+                  <button
+                    key={opt.k}
+                    onClick={() => setFilterMode(opt.k)}
+                    aria-pressed={filterMode === opt.k}
+                    className={`px-2.5 py-1 rounded-chip font-semibold transition-colors ${
+                      filterMode === opt.k
+                        ? 'bg-primary-100 text-primary-700'
+                        : 'text-ink-2 hover:text-ink'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {filteredSkills.length > 0 && (
+                <button
+                  onClick={() =>
+                    setVisibilityForList(
+                      filteredSkills.map((s) => s.name),
+                      !allFilteredEnabled,
+                    )
+                  }
+                  className="flex items-center gap-1 text-xs font-bold text-primary-600 hover:text-primary-800 px-2 py-1 rounded-chip transition-colors"
+                  title={allFilteredEnabled ? t('skills.hide_all_tooltip') : t('skills.show_all_tooltip')}
+                >
+                  {allFilteredEnabled ? (
+                    <>
+                      <EyeOff className="w-3.5 h-3.5" /> {t('skills.hide_all')}
+                    </>
+                  ) : (
+                    <>
+                      <Eye className="w-3.5 h-3.5" /> {t('skills.show_all')}
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+            {search && (
+              <div className="text-xs text-ink-3 mt-2 font-medium">
+                {t('skills.match_count', { total: filteredSkills.length, visible: filteredEnabledCount })}
+              </div>
+            )}
+          </div>
+
+          {totalCount === 0 && !isNew && (
+            <div className="p-6 bg-sunken rounded-card border-2 border-dashed border-line text-center">
+              <BookOpen className="w-8 h-8 text-ink-3 mx-auto mb-2" />
+              <p className="text-sm text-ink-2">
+                {t('skills.no_skills_yet')} <strong>{t('skills.new_button')}</strong> {t('skills.no_skills_yet_suffix')}
+              </p>
+            </div>
+          )}
+
+          {totalCount > 0 && filteredSkills.length === 0 && (
+            <div className="p-6 bg-sunken rounded-card border border-dashed border-line text-center">
+              <p className="text-sm text-ink-2">{t('skills.no_filter_match')}</p>
+            </div>
+          )}
+
+          {filteredSkills.length > 0 && (
+            <div className="max-h-[calc(100vh-340px)] overflow-y-auto pr-1 -mr-1 space-y-1.5">
+              {filteredSkills.map((s) => {
+                const isActive = selectedName === s.name && !isNew
+                return (
+                  <div
+                    key={s.name}
+                    className={`group flex items-center gap-2 p-2.5 rounded-control transition-all border ${
+                      isActive
+                        ? 'bg-panel border-primary-400 shadow-md ring-1 ring-primary-200'
+                        : s.enabled
+                        ? 'bg-panel border-line hover:border-primary-200 hover:shadow-sm'
+                        : 'bg-sunken border-line hover:border-line-2'
+                    }`}
+                  >
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        toggleSkill(s.name)
+                      }}
+                      title={s.enabled ? t('skills.hide_from_agent') : t('skills.show_to_agent')}
+                      aria-label={s.enabled ? t('skills.hide_from_agent') : t('skills.show_to_agent')}
+                      aria-pressed={s.enabled}
+                      className="flex-shrink-0 p-1 rounded-chip hover:bg-sunken transition-colors"
+                    >
+                      {s.enabled ? (
+                        <CheckSquare className="w-5 h-5 text-primary-600" />
+                      ) : (
+                        <Square className="w-5 h-5 text-ink-3" />
+                      )}
+                    </button>
+                    <button
+                      onClick={() => loadSkill(s.name)}
+                      className="flex-1 min-w-0 text-left"
+                    >
+                      <div
+                        className={`font-bold text-sm truncate ${
+                          s.enabled ? 'text-ink' : 'text-ink-3'
+                        }`}
+                      >
+                        {s.name}
+                      </div>
+                      <div
+                        className={`text-xs truncate ${
+                          s.enabled ? 'text-ink-2' : 'text-ink-3'
+                        }`}
+                      >
+                        {s.description}
+                      </div>
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          <div className="note mt-4 relative overflow-hidden">
+            <div className="relative z-10">
+              <div className="flex items-center gap-2 mb-2">
+                <BookOpen className="w-5 h-5 text-primary-600" />
+                <h4 className="font-bold text-base">{t('skills.progressive_disclosure')}</h4>
+              </div>
+              <p className="text-ink-2 text-xs leading-relaxed">
+                {t('skills.progressive_body')}
+              </p>
+            </div>
+            <div className="absolute -right-10 -bottom-10 w-32 h-32 bg-primary-300/20 rounded-full blur-3xl"></div>
+          </div>
+        </div>
+
+        <div className="lg:col-span-7 xl:col-span-8 space-y-4 h-full flex flex-col">
+          {!editorActive ? (
+            <div className="card p-12 text-center bg-sunken border-dashed border-2 border-line min-h-[600px] flex flex-col items-center justify-center">
+              <Sparkles className="w-12 h-12 text-ink-3 mb-4" />
+              <p className="text-ink-2 font-medium">
+                {t('skills.editor_empty')} <strong>{t('skills.new_button')}</strong> {t('skills.editor_empty_suffix')}
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="card p-6 bg-panel space-y-4">
+                <div>
+                  <label htmlFor="skill-name" className="block text-xs font-bold text-ink-2 uppercase tracking-wider mb-2">
+                    {t('skills.name_label')}
+                  </label>
+                  <input
+                    id="skill-name"
+                    type="text"
+                    value={editorName}
+                    onChange={(e) => setEditorName(e.target.value)}
+                    disabled={!isNew}
+                    placeholder={t('skills.name_placeholder')}
+                    className="w-full px-4 py-2.5 border border-line rounded-control font-mono text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 disabled:bg-sunken disabled:text-ink-2"
+                  />
+                  {isNew && (
+                    <p className="text-xs text-ink-3 mt-1.5">
+                      {t('skills.name_hint')}
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label htmlFor="skill-description" className="block text-xs font-bold text-ink-2 uppercase tracking-wider mb-2">
+                    {t('skills.description_label')}
+                  </label>
+                  <input
+                    id="skill-description"
+                    type="text"
+                    value={editorDescription}
+                    onChange={(e) => setEditorDescription(e.target.value)}
+                    placeholder={t('skills.description_placeholder')}
+                    className="w-full px-4 py-2.5 border border-line rounded-control text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400"
+                  />
+                </div>
+              </div>
+
+              <div className="card h-full flex flex-col p-1 bg-sunken border-line shadow-inner min-h-[500px] relative">
+                <label htmlFor="skill-body" className="sr-only">{t('skills.body_label')}</label>
+                <textarea
+                  id="skill-body"
+                  value={editorBody}
+                  onChange={(e) => setEditorBody(e.target.value)}
+                  className="w-full flex-1 p-8 bg-panel rounded-card border-none focus:ring-0 font-mono text-sm leading-relaxed text-ink resize-none shadow-sm placeholder-ink-3"
+                  placeholder={t('skills.body_placeholder')}
+                  onKeyDown={(e) => {
+                    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                      e.preventDefault()
+                      if (!saving) handleSave()
+                    }
+                  }}
+                />
+              </div>
+              <div className="flex items-center justify-between px-2 text-xs text-ink-3 font-medium font-mono">
+                <div>
+                  {t('skills.tokens_lines', { tokens: Math.ceil(editorBody.length / 4), lines: editorBody.split('\n').length })}
+                </div>
+                <div>{t('skills.shortcut')}</div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

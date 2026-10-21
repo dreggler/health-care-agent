@@ -1,0 +1,400 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+from typing import Any
+
+from ..errors import FallbackTriggered
+from . import (
+    BaseLLMProvider,
+    parse_image_data_uri,
+    provider_write_log,
+    retry_async,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _openai_content_to_anthropic(content: list) -> list:
+    out: list[dict] = []
+    for b in content:
+        if not isinstance(b, dict):
+            out.append({"type": "text", "text": str(b)})
+            continue
+        if b.get("type") == "image_url":
+            url = (b.get("image_url") or {}).get("url", "")
+            mime, data = parse_image_data_uri(url)
+            if data:
+                out.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": data},
+                })
+        else:
+            out.append({"type": "text", "text": b.get("text", "")})
+    return out or [{"type": "text", "text": ""}]
+
+
+class AnthropicProvider(BaseLLMProvider):
+
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-6",
+        api_key: str | None = None,
+        *,
+        thinking_budget: int | None = 1024,
+    ) -> None:
+        super().__init__(model, api_key)
+        self.thinking_budget = thinking_budget
+        try:
+            import anthropic
+            self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        except ImportError as exc:
+            raise ImportError(
+                "anthropic package required. Install: pip install anthropic>=0.40"
+            ) from exc
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def supports_vision(self) -> bool:
+        return True
+
+    async def complete(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        stream: bool = True,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        _t0 = time.perf_counter()
+        try:
+            effective_max_tokens = max_tokens if max_tokens is not None else 8192
+            thinking_enabled = (
+                self.thinking_budget is not None
+                and effective_max_tokens > self.thinking_budget
+            )
+            if self.thinking_budget is not None and not thinking_enabled:
+                logger.debug(
+                    "Extended thinking disabled for this call: max_tokens=%s <= budget=%s",
+                    effective_max_tokens, self.thinking_budget,
+                )
+
+            system_prompt, filtered_messages = self._extract_system(
+                messages, include_thinking=thinking_enabled,
+            )
+
+            request_kwargs: dict[str, Any] = {
+                "model":      self.model,
+                "messages":   filtered_messages,
+                "max_tokens": effective_max_tokens,
+            }
+            if system_prompt:
+                request_kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+
+            if not thinking_enabled:
+                request_kwargs["temperature"] = temperature
+
+            if thinking_enabled:
+                request_kwargs["thinking"] = {
+                    "type":         "enabled",
+                    "budget_tokens": self.thinking_budget,
+                }
+
+            if tools:
+                request_kwargs["tools"] = self._convert_tools(tools)
+
+            async def _stream_call():
+                mgr = self._client.messages.stream(**request_kwargs)
+                return mgr, await mgr.__aenter__()
+
+            resp_ctx, stream = await retry_async(_stream_call)
+
+            tool_accum: dict[int, dict[str, str]] = {}
+
+            response_texts: list[str] = []
+            tool_calls_list: list[dict] = []
+            prompt_tokens = completion_tokens = None
+            cache_read_tokens: int | None = None
+            cache_creation_tokens: int | None = None
+            stop_reason: str | None = None
+            thinking_parts: list[str] = []
+            thinking_signature: str | None = None
+
+            try:
+                async for event in stream:
+                    etype = event.type
+
+                    if etype == "message_start":
+                        usage = getattr(event.message, "usage", None)
+                        if usage:
+                            prompt_tokens = getattr(usage, "input_tokens", None)
+                            cache_read_tokens = getattr(usage, "cache_read_input_tokens", None)
+                            cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", None)
+
+                    elif etype == "message_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            sr = getattr(delta, "stop_reason", None)
+                            if sr:
+                                stop_reason = sr
+                        usage = getattr(event, "usage", None)
+                        if usage:
+                            completion_tokens = getattr(usage, "output_tokens", None)
+
+                    elif etype == "content_block_start":
+                        block = event.content_block
+                        idx   = event.index
+
+                        if block.type == "thinking":
+                            pass
+
+                        elif block.type == "tool_use":
+                            tool_accum[idx] = {
+                                "id":           block.id,
+                                "name":         block.name,
+                                "arguments_buf": "",
+                            }
+
+                    elif etype == "content_block_delta":
+                        delta = event.delta
+                        idx   = event.index
+
+                        if delta.type == "text_delta":
+                            text = delta.text or ""
+                            response_texts.append(text)
+                            yield {"type": "content", "content": text}
+
+                        elif delta.type == "thinking_delta":
+                            thinking_text = delta.thinking or ""
+                            thinking_parts.append(thinking_text)
+                            yield {"type": "agent_thinking", "content": thinking_text}
+
+                        elif delta.type == "signature_delta":
+                            thinking_signature = (
+                                (thinking_signature or "")
+                                + (getattr(delta, "signature", "") or "")
+                            )
+
+                        elif delta.type == "input_json_delta":
+                            if idx in tool_accum:
+                                piece = delta.partial_json or ""
+                                tool_accum[idx]["arguments_buf"] += piece
+                                if piece:
+                                    yield {
+                                        "type": "tool_call_delta",
+                                        "index": idx,
+                                        "name": tool_accum[idx]["name"],
+                                        "arguments_delta": piece,
+                                    }
+
+                    elif etype == "content_block_stop":
+                        idx = event.index
+                        if idx in tool_accum:
+                            tc_info = tool_accum[idx]
+                            try:
+                                args = (
+                                    json.loads(tc_info["arguments_buf"])
+                                    if tc_info["arguments_buf"]
+                                    else {}
+                                )
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    "Could not parse tool arguments for %s: %s",
+                                    tc_info["name"], tc_info["arguments_buf"][:200],
+                                )
+                                args = {"_raw": tc_info["arguments_buf"]}
+                            tc = {"id": tc_info["id"], "name": tc_info["name"], "arguments": args}
+                            tool_calls_list.append(tc)
+                            yield {"type": "tool_call", **tc}
+            finally:
+                await resp_ctx.__aexit__(None, None, None)
+
+            if thinking_signature and thinking_parts:
+                yield {
+                    "type": "thought_signature",
+                    "signature": json.dumps({
+                        "thinking": "".join(thinking_parts),
+                        "signature": thinking_signature,
+                    }),
+                }
+
+            if prompt_tokens is not None or completion_tokens is not None:
+                truncated = (
+                    stop_reason == "max_tokens"
+                    or (
+                        completion_tokens is not None
+                        and max_tokens is not None
+                        and completion_tokens >= max_tokens
+                    )
+                )
+                yield {
+                    "type": "token_usage",
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "truncated": truncated,
+                    "max_tokens": max_tokens,
+                }
+
+            provider_write_log(
+                provider="anthropic",
+                model=self.model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                duration_ms=int((time.perf_counter() - _t0) * 1000),
+                tools=tools,
+                messages=messages,
+                tool_calls_list=tool_calls_list,
+                response_texts=response_texts,
+            )
+
+        except FallbackTriggered as exc:
+            logger.warning("Anthropic fallback triggered: %s", exc)
+            provider_write_log(
+                provider="anthropic",
+                model=self.model,
+                prompt_tokens=None,
+                completion_tokens=None,
+                duration_ms=int((time.perf_counter() - _t0) * 1000),
+                tools=tools,
+                messages=messages,
+                tool_calls_list=[],
+                response_texts=[f"ERROR: fallback — {exc}"],
+            )
+            raise
+        except Exception as exc:
+            logger.error("Anthropic API error: %s", exc, exc_info=True)
+            provider_write_log(
+                provider="anthropic",
+                model=self.model,
+                prompt_tokens=None,
+                completion_tokens=None,
+                duration_ms=int((time.perf_counter() - _t0) * 1000),
+                tools=tools,
+                messages=messages,
+                tool_calls_list=[],
+                response_texts=[f"ERROR: {exc}"],
+            )
+            yield {"type": "error", "error": str(exc)}
+
+
+    @staticmethod
+    def _decode_thinking_block(signature: Any) -> dict | None:
+        if not signature or not isinstance(signature, str):
+            return None
+        try:
+            blob = json.loads(signature)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(blob, dict):
+            return None
+        thinking = blob.get("thinking")
+        sig = blob.get("signature")
+        if not thinking or not sig:
+            return None
+        return {"type": "thinking", "thinking": thinking, "signature": sig}
+
+    @staticmethod
+    def _extract_system(
+        messages: list[dict], *, include_thinking: bool = True,
+    ) -> tuple[str | None, list[dict]]:
+        system_parts: list[str] = []
+        filtered: list[dict]    = []
+
+        pending_tool_results: list[dict] = []
+
+        def _flush_tool_results():
+            if pending_tool_results:
+                filtered.append({
+                    "role": "user",
+                    "content": list(pending_tool_results),
+                })
+                pending_tool_results.clear()
+
+        for msg in messages:
+            role = msg["role"]
+
+            if role == "system":
+                system_parts.append(msg.get("content") or "")
+                continue
+
+            if role == "tool":
+                pending_tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", ""),
+                })
+                continue
+
+            _flush_tool_results()
+
+            if role == "assistant" and msg.get("tool_calls"):
+                content_blocks = []
+                if include_thinking:
+                    thinking_block = AnthropicProvider._decode_thinking_block(
+                        msg.get("signature")
+                    )
+                    if thinking_block:
+                        content_blocks.append(thinking_block)
+                text = msg.get("content")
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            tool_name = fn.get("name", "unknown")
+                            logger.warning("Malformed tool args for %s, using {}", tool_name)
+                            args = {}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": args,
+                    })
+                filtered.append({"role": "assistant", "content": content_blocks})
+            else:
+                content = msg.get("content")
+                if isinstance(content, list):
+                    content = _openai_content_to_anthropic(content)
+                filtered.append({"role": role, "content": content if content else ""})
+
+        _flush_tool_results()
+        system = "\n".join(system_parts) if system_parts else None
+        return system, filtered
+
+    @staticmethod
+    def _convert_tools(tools: list[dict]) -> list[dict]:
+        converted = []
+        for tool in tools:
+            if tool.get("type") != "function" or "function" not in tool:
+                continue
+            fn = tool["function"]
+            converted.append(
+                {
+                    "name":         fn["name"],
+                    "description":  fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
+        return converted
+
+
+from . import LLMProvider, register_provider
+
+register_provider(LLMProvider.ANTHROPIC, AnthropicProvider)

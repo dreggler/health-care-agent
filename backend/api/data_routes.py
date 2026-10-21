@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
+
+from ..data_readers import BaseDataReader, create_reader
+from ..utils import dataframe_to_json_safe
+from .agent_state import require_valid_ids
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/data", tags=["data"], dependencies=[Depends(require_valid_ids)])
+
+
+_reader: BaseDataReader | None = None
+
+
+def _ensure_reader() -> BaseDataReader:
+    global _reader
+    if _reader is None:
+        base_dir = Path(__file__).parent.parent.parent
+        path = (base_dir / "ios" / "Server").resolve()
+        logger.info("Initialising data reader: source=live path=%s", path)
+        _reader = create_reader("live", path)
+        logger.info("Data reader ready: live")
+    return _reader
+
+
+def _flush_reader() -> None:
+    global _reader
+    _reader = None
+
+
+@router.post("/reload")
+async def reload_reader():
+    _flush_reader()
+    try:
+        await asyncio.to_thread(_ensure_reader)
+        return {"success": True, "data_source": "live"}
+    except Exception as exc:
+        logger.error("Data reader reload failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to reload data reader.") from exc
+
+
+@router.get("/users")
+async def list_users(datasets: list[str] | None = Query(None)):
+    reader = await _init_or_raise()
+    try:
+        users = await asyncio.to_thread(reader.get_available_users, datasets)
+        ds = datasets or await asyncio.to_thread(reader.get_datasets)
+        return {
+            "success":      True,
+            "users": users,
+            "count":        len(users),
+            "datasets":     ds,
+            "data_source":  "live",
+        }
+    except Exception as exc:
+        logger.error("Error listing users: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list users.") from exc
+
+
+@router.get("/features/{pid}")
+async def get_user_features(
+    pid: str,
+    feature_type: str = Query("steps"),
+):
+    reader = await _init_or_raise()
+    try:
+        df = await asyncio.to_thread(reader.load_feature_data, [pid], feature_type)
+        if df.empty:
+            return {
+                "success":      True,
+                "user":  pid,
+                "feature_type": feature_type,
+                "features":     [],
+                "num_features": 0,
+                "num_records":  0,
+                "date_range":   {"start": None, "end": None},
+                "data_source":  "live",
+            }
+        features   = [c for c in df.columns if c not in ("pid", "date", "dataset")]
+        date_range = await asyncio.to_thread(reader.get_date_range, [pid])
+        return {
+            "success":      True,
+            "user":  pid,
+            "feature_type": feature_type,
+            "features":     features,
+            "num_features": len(features),
+            "date_range":   {
+                "start": date_range[0].strftime('%Y-%m-%dT%H:%M:%S') if date_range[0] else None,
+                "end":   date_range[1].strftime('%Y-%m-%dT%H:%M:%S') if date_range[1] else None,
+            },
+            "num_records":  len(df),
+            "data_source":  "live",
+        }
+    except Exception as exc:
+        logger.error("Error fetching features for %s: %s", pid, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch features.") from exc
+
+
+@router.get("/inspect/{pid}")
+async def inspect_user_data(
+    pid:          str,
+    feature_type: str = Query("steps"),
+    limit:        int = Query(100, ge=1, le=1000),
+):
+    reader = await _init_or_raise()
+    try:
+        df = await asyncio.to_thread(reader.load_feature_data, [pid], feature_type)
+        if df.empty:
+            return Response(
+                content=json.dumps({
+                    "success":      True,
+                    "user":  str(pid),
+                    "feature_type": str(feature_type),
+                    "num_records":  0,
+                    "sample_size":  0,
+                    "columns":      [],
+                    "data":         []
+                }),
+                media_type="application/json",
+            )
+
+        sample       = df.head(limit)
+        data_records = dataframe_to_json_safe(sample)
+
+        result = {
+            "success":      True,
+            "user":  str(pid),
+            "feature_type": str(feature_type),
+            "num_records":  int(len(df)),
+            "sample_size":  int(len(sample)),
+            "columns":      [str(c) for c in sample.columns.tolist()],
+            "data":         data_records,
+        }
+
+        return Response(content=json.dumps(result), media_type="application/json")
+
+    except Exception as exc:
+        logger.error("Error inspecting data for %s/%s: %s", pid, feature_type, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to inspect data.") from exc
+
+
+@router.get("/datasets")
+async def list_datasets():
+    reader = await _init_or_raise()
+    datasets = await asyncio.to_thread(reader.get_datasets)
+    return {"success": True, "datasets": datasets, "count": len(datasets), "data_source": "live"}
+
+
+@router.get("/feature_types")
+async def list_feature_types():
+    reader = await _init_or_raise()
+    feature_types = await asyncio.to_thread(reader.get_feature_types)
+    return {"success": True, "feature_types": feature_types, "data_source": "live"}
+
+
+@router.get("/source")
+async def get_data_source():
+    return {
+        "success":          True,
+        "data_source":      "live",
+        "available_sources": ["live"],
+    }
+
+
+@router.get("/feature_metadata")
+async def get_feature_metadata():
+    try:
+        from ..data_readers.apple_health_features import FEATURE_SPEC
+        features = {
+            k: {
+                "display_unit":  v.get("display_unit", ""),
+                "format":        v.get("format", "{:.2f}"),
+                "display_scale": v.get("display_scale", 1),
+            }
+            for k, v in FEATURE_SPEC.items()
+        }
+        return {"success": True, "features": features, "data_source": "live"}
+    except Exception as exc:
+        logger.error("Error loading feature metadata: %s", exc, exc_info=True)
+        return {"success": False, "features": {}, "error": "Failed to load feature metadata."}
+
+
+@router.get("/count")
+async def get_storage_count():
+    reader = await _init_or_raise()
+    try:
+        total = await asyncio.to_thread(reader.get_total_sample_count)
+        return {"success": True, "count": int(total)}
+    except Exception as exc:
+        logger.error("Storage count error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to count samples.") from exc
+
+
+@router.get("/dashboard")
+async def get_dashboard_data(minutes: int = Query(1440, ge=10, le=43200)):
+    _MAX_POINTS_PER_FEATURE = 2000
+    reader = await _init_or_raise()
+    try:
+        feature_types = await asyncio.to_thread(reader.get_feature_types)
+
+        async def _load_feature(ft: str):
+            try:
+                def _load_points(_ft: str = ft) -> list[dict]:
+                    df = reader.load_feature_data(
+                        ["LiveUser"], _ft, minutes=minutes, limit=_MAX_POINTS_PER_FEATURE
+                    )
+                    if df.empty:
+                        return []
+                    ts = pd.to_numeric(df["ts"], errors="coerce").to_numpy(dtype=float)
+                    v = pd.to_numeric(df["value"], errors="coerce").to_numpy(dtype=float)
+                    keep = np.isfinite(ts) & np.isfinite(v)
+                    return [
+                        {"ts": t, "v": x}
+                        for t, x in zip(ts[keep].tolist(), v[keep].tolist(), strict=True)
+                    ]
+
+                return ft, await asyncio.to_thread(_load_points)
+            except Exception:
+                return ft, []
+
+        results = await asyncio.gather(*[_load_feature(ft) for ft in feature_types])
+        result: dict = {ft: pts for ft, pts in results if pts}
+        return {"success": True, "features": result, "count": len(result)}
+    except Exception as exc:
+        logger.error("Dashboard data error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load dashboard data.") from exc
+
+
+async def _init_or_raise() -> BaseDataReader:
+    try:
+        return await asyncio.to_thread(_ensure_reader)
+    except Exception as exc:
+        logger.error("Data reader initialisation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Data reader initialisation failed.",
+        ) from exc
