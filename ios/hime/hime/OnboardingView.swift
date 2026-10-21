@@ -1,0 +1,676 @@
+import SwiftUI
+
+
+struct OnboardingView: View {
+    @Binding var hasOnboarded: Bool
+
+    @AppStorage("hime.hasConsentedToAIDataSharing") private var hasConsentedToAI: Bool = false
+
+    @State private var pageIndex: Int = 0
+    @State private var serverAddress: String = ServerConfig.defaultAddress
+    @State private var serverTestState: ServerTestState = .idle
+    @State private var didRequestHealthKit = false
+    @State private var aiConsentChecked: Bool = false
+
+
+    @StateObject private var survey = SurveyModel()
+
+    private let totalPages = 7
+
+    enum ServerTestState: Equatable {
+        case idle
+        case testing
+        case success(String)
+        case failure(String)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            TabView(selection: $pageIndex) {
+                welcomePage.tag(0)
+                healthKitPage.tag(1)
+                serverPage.tag(2)
+                aiDisclosurePage.tag(3)
+                catPage.tag(4)
+                goalSurveyPage.tag(5)
+                readyPage.tag(6)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .indexViewStyle(.page(backgroundDisplayMode: .always))
+
+
+            VStack(spacing: 16) {
+                HStack(spacing: 8) {
+                    ForEach(0..<totalPages, id: \.self) { idx in
+                        Circle()
+                            .fill(idx == pageIndex
+                                  ? HimeColor.accent
+                                  : HimeColor.idle)
+                            .frame(width: idx == pageIndex ? 9 : 7,
+                                   height: idx == pageIndex ? 9 : 7)
+                            .animation(.spring(response: 0.3), value: pageIndex)
+                    }
+                }
+
+                primaryButton
+                    .padding(.horizontal, 24)
+
+
+                Text(" ").font(.footnote)
+            }
+            .padding(.bottom, 30)
+            .padding(.top, 12)
+        }
+        .background(HimeColor.paper.ignoresSafeArea())
+    }
+
+
+    private var welcomePage: some View {
+        OnboardingPage(
+            icon: "sparkles",
+            iconColor: HimeColor.accent,
+            title: "Welcome to Hime",
+            subtitle: "Health Intelligence Management Engine",
+            bodyText: "As your personal AI health assistant, Hime understands your real-time health data, feels your heart beats, your breath, and your body's movements, and provides proactive insights so you never miss what matters. \n\nFully self-hosted, secure, and open-source. Say **Hi** to healthy **Me**!"
+        )
+    }
+
+    private var healthKitPage: some View {
+        OnboardingPage(
+            icon: "heart.text.square.fill",
+            iconColor: HimeColor.rose,
+            title: "Apple Health Access",
+            subtitle: "Read-only and on-device",
+            bodyText: "Hime reads wearable health data from Apple Health so the AI agent can analyse trends. Hime never writes to Health and you have the full control on how and where AI process the data.",
+            extraContent: AnyView(
+                VStack(spacing: 8) {
+                    if didRequestHealthKit {
+                        Label("Access requested", systemImage: "checkmark.circle.fill")
+                            .foregroundColor(HimeColor.ok)
+                            .font(.subheadline)
+                    }
+                }
+            )
+        )
+    }
+
+    private var serverPage: some View {
+
+
+        GeometryReader { geo in
+            ScrollView(.vertical, showsIndicators: false) {
+                serverPageContent
+                    .frame(minHeight: geo.size.height)
+                    .frame(maxWidth: .infinity)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+    }
+
+    private var serverPageContent: some View {
+        VStack(spacing: 20) {
+            Spacer(minLength: 24)
+
+            Image(systemName: "server.rack")
+                .font(.system(size: 64))
+                .foregroundColor(HimeColor.accentStrong)
+
+            VStack(spacing: 6) {
+                Text("Connect Your Server")
+                    .font(.system(size: 26, weight: .bold, design: .rounded))
+                    .multilineTextAlignment(.center)
+                Text("Self-hosted, full control on your data")
+                    .font(.subheadline)
+                    .foregroundColor(HimeColor.ink2)
+            }
+            .padding(.horizontal, 32)
+
+            Text("Hime runs on your own server. Follow the Hime GitHub Repo to deploy your own server.")
+                .font(.body)
+                .foregroundColor(HimeColor.ink)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+                .fixedSize(horizontal: false, vertical: true)
+
+            serverPageForm
+                .padding(.horizontal, 24)
+
+            Spacer(minLength: 24)
+        }
+    }
+
+    private var serverPageForm: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "network")
+                    .foregroundColor(HimeColor.ink2)
+                TextField("192.168.1.100 or example.com", text: $serverAddress)
+                    .keyboardType(.URL)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .submitLabel(.go)
+                    .onSubmit {
+                        Task { await testServerConnection() }
+                    }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(HimeColor.card)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            Button {
+                Task { await testServerConnection() }
+            } label: {
+                HStack(spacing: 6) {
+                    if serverTestState == .testing {
+                        ProgressView().scaleEffect(0.8)
+                    }
+                    Text(testButtonTitle)
+                        .fontWeight(.medium)
+                }
+            }
+            .disabled(serverTestState == .testing || serverAddress.isEmpty)
+
+            serverTestResult
+
+            Link(destination: URL(string: "https://github.com/thinkwee/HiMe")!) {
+                Label("Setup Guide on GitHub", systemImage: "link")
+                    .font(.footnote)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var serverTestResult: some View {
+        switch serverTestState {
+        case .success(let msg):
+            Label(msg, systemImage: "checkmark.circle.fill")
+                .foregroundColor(HimeColor.ok)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+        case .failure(let msg):
+            Label(msg, systemImage: "xmark.octagon.fill")
+                .foregroundColor(HimeColor.bad)
+                .font(.footnote)
+                .multilineTextAlignment(.center)
+        default:
+            EmptyView()
+        }
+    }
+
+    private var aiDisclosurePage: some View {
+        VStack(spacing: 0) {
+
+            VStack(spacing: 6) {
+                Image(systemName: "brain.head.profile")
+                    .font(.system(size: 40))
+                    .foregroundColor(HimeColor.accentStrong)
+                Text("AI Data Sharing")
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                Text("Scroll to read all sections, then agree below")
+                    .font(.caption)
+                    .foregroundColor(HimeColor.ink2)
+            }
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(AIDisclosureContent.bodyText)
+                        .font(.callout)
+                        .foregroundColor(HimeColor.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    AIDisclosureDetails()
+
+                    Toggle(isOn: $aiConsentChecked) {
+                        Text("I understand and agree to share my data with the third-party AI service configured on my server.")
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .tint(HimeColor.accent)
+                    .padding(.top, 4)
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .padding(.bottom, 16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private var catPage: some View {
+        OnboardingPage(
+            icon: "cat.fill",
+            iconColor: HimeColor.accent,
+            title: "Meet HiMeow",
+            subtitle: "Your AI digital health avatar",
+            bodyText: "HiMeow is a AI digital health avatar that lives on your home screen and reflects your real-time health state. It's happy when you are well-rested, concerned when something looks off. \nLong-press HiMeow anytime for an instant health report and quick AI analysis.",
+            customIcon: AnyView(
+                CatHeadView(catState: "happy")
+                    .frame(width: 120, height: 120)
+            )
+        )
+    }
+
+    private var goalSurveyPage: some View {
+        GoalSurveyView(model: survey)
+    }
+
+    private var readyPage: some View {
+        OnboardingPage(
+            icon: "checkmark.seal.fill",
+            iconColor: .green,
+            title: "You're All Set",
+            subtitle: "Let's get started",
+            bodyText: "Hime is ready. \n Long press the HiMeow in the home tab and the AI agent will start analysing health trends and pushing reports automatically."
+        )
+    }
+
+
+    @ViewBuilder
+    private var primaryButton: some View {
+        switch pageIndex {
+        case 0:
+            nextButton(title: "Get Started")
+        case 1:
+            Button {
+                Task { await requestHealthKitAuth() }
+            } label: {
+                Text(didRequestHealthKit ? "Continue" : "Grant Access")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(HimeColor.accent)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        case 2:
+            VStack(spacing: 8) {
+                Button {
+                    if canAdvanceFromServerPage {
+                        advance()
+                    }
+                } label: {
+                    Text("Continue")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(canAdvanceFromServerPage ? HimeColor.accent : HimeColor.idleStrong)
+                        .foregroundColor(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .disabled(!canAdvanceFromServerPage)
+
+                Button("Skip for now") {
+                    advance()
+                }
+                .font(.footnote)
+                .foregroundColor(HimeColor.ink2)
+            }
+        case 3:
+            Button {
+                if aiConsentChecked {
+                    hasConsentedToAI = true
+                    advance()
+                }
+            } label: {
+                Text("I Agree & Continue")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(aiConsentChecked ? HimeColor.accent : HimeColor.idleStrong)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            .disabled(!aiConsentChecked)
+        case 4:
+            nextButton(title: "Continue")
+        case 5:
+            VStack(spacing: 8) {
+                Button {
+                    if survey.isLast {
+                        submitSurvey()
+                    } else {
+                        withAnimation { survey.next() }
+                    }
+                } label: {
+                    Text(survey.isLast ? "Done" : "Next")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(survey.canProceed ? HimeColor.accent : HimeColor.idleStrong)
+                        .foregroundColor(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .disabled(!survey.canProceed)
+
+                Button("Skip for now") {
+                    advance()
+                }
+                .font(.footnote)
+                .foregroundColor(HimeColor.ink2)
+            }
+        case 6:
+            Button {
+                finishOnboarding()
+            } label: {
+                Text("Start")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(HimeColor.leaf)
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        default:
+            EmptyView()
+        }
+    }
+
+    private func nextButton(title: LocalizedStringKey) -> some View {
+        Button {
+            advance()
+        } label: {
+            Text(title)
+                .fontWeight(.semibold)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(HimeColor.accent)
+                .foregroundColor(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+
+    private var canAdvanceFromServerPage: Bool {
+        if case .success = serverTestState { return true }
+        return false
+    }
+
+    private var testButtonTitle: LocalizedStringKey {
+        switch serverTestState {
+        case .testing: return "Testing..."
+        case .success: return "Test Again"
+        default: return "Test Connection"
+        }
+    }
+
+    private func advance() {
+        withAnimation { pageIndex = min(pageIndex + 1, totalPages - 1) }
+    }
+
+    private func finishOnboarding() {
+        hasOnboarded = true
+    }
+
+
+    private func submitSurvey() {
+        if survey.hasAnyAnswer {
+            let p = survey.payload()
+            Task { await postSurvey(goals: p.goals, answers: p.answers) }
+        }
+        advance()
+    }
+
+    private func postSurvey(goals: [String], answers: [String: Any]) async {
+
+
+        ServerConfig.stashPendingSurvey(["goals": goals, "answers": answers])
+        await ServerConfig.flushPendingSurvey()
+    }
+
+    private func requestHealthKitAuth() async {
+        await HealthKitManager.shared.setup()
+        didRequestHealthKit = true
+        advance()
+    }
+
+    private func testServerConnection() async {
+        serverTestState = .testing
+        let cleaned = ServerConfig.normalized(ServerConfig.extractBase(from: serverAddress))
+        serverAddress = cleaned
+        let cfg = ServerConfig(baseAddress: cleaned)
+        cfg.save()
+
+
+        WebSocketClient.shared.serverConfig = cfg
+        switch await APIClient.probe(cfg) {
+        case .ok:
+            let fmt = String(localized: "Connected to %@")
+            serverTestState = .success(String(format: fmt, cfg.baseAddress))
+
+
+            WebSocketClient.shared.serverSettingsDidChange()
+        case .unauthorized:
+            serverTestState = .failure(String(localized: "Server rejected the auth token (401). Check it in Settings."))
+        case .invalidAddress:
+            serverTestState = .failure(String(localized: "Invalid server address"))
+        case .serverError:
+            serverTestState = .failure(String(localized: "Server responded with an error"))
+        case .unreachable:
+            serverTestState = .failure(String(localized: "Could not reach server"))
+        }
+    }
+}
+
+
+private struct OnboardingPage: View {
+    let icon: String
+    let iconColor: Color
+    let title: LocalizedStringKey
+    let subtitle: LocalizedStringKey
+    let bodyText: LocalizedStringKey
+    var extraContent: AnyView? = nil
+    var customIcon: AnyView? = nil
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 40)
+
+            if let custom = customIcon {
+                custom.padding(.bottom, 24)
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 72))
+                    .foregroundColor(iconColor)
+                    .padding(.bottom, 24)
+            }
+
+            Text(title)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            Text(subtitle)
+                .font(.subheadline)
+                .foregroundColor(HimeColor.ink2)
+                .padding(.top, 4)
+
+            Text(bodyText)
+                .font(.body)
+                .foregroundColor(HimeColor.ink)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+                .padding(.top, 20)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let extra = extraContent {
+                extra.padding(.top, 24)
+            }
+
+            Spacer(minLength: 40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+
+enum AIDisclosureContent {
+    static let bodyText: LocalizedStringKey = "Hime is self-hosted, but your server forwards your data to a third-party AI service that you choose and configure. Please review the details below before continuing."
+}
+
+struct AIDisclosureDetails: View {
+    @State private var showFullPolicy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DisclosureRow(
+                icon: "tray.full",
+                title: "What is sent",
+                text: "Health metrics from Apple Health (heart rate, HRV, SpO2, respiratory rate, sleep stages, steps, active energy, workouts, and related wearable data) and the text of your conversations with the AI agent."
+            )
+            DisclosureRow(
+                icon: "person.2",
+                title: "Who it is sent to",
+                text: "The third-party AI provider you configure on your server. Supported providers include OpenAI, Anthropic, Google (Gemini / Vertex), Mistral, Groq, DeepSeek, xAI, OpenRouter, Perplexity, Amazon Bedrock, Azure OpenAI, ZhipuAI, MiniMax, or a self-hosted vLLM endpoint. The provider you select will receive your data under its own terms and privacy policy."
+            )
+            DisclosureRow(
+                icon: "arrow.triangle.branch",
+                title: "How it is sent",
+                text: "Data travels from this app to the Hime server you deploy, and your server makes API calls to the AI provider you selected. Hime does not upload your data to any service operated by the app developer."
+            )
+            DisclosureRow(
+                icon: "hand.raised",
+                title: "Your control",
+                text: "You can revoke consent any time in Settings → Data & Privacy. Revoking consent stops the app from sending data and returns you to onboarding."
+            )
+            Button {
+                showFullPolicy = true
+            } label: {
+                Label("Read the full privacy policy", systemImage: "doc.text")
+                    .font(.footnote)
+            }
+            .padding(.top, 2)
+        }
+        .sheet(isPresented: $showFullPolicy) {
+            PrivacyPolicySheet()
+        }
+    }
+}
+
+
+struct PrivacyPolicySheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    PolicyHeading("Hime Privacy Policy")
+                    PolicyMeta("Last updated: 2026-04-15")
+
+                    PolicySection(title: "1. Who we are") {
+                        "Hime (Health Intelligence Management Engine) is an open-source, self-hosted AI health assistant. The iOS app is a client that communicates only to a backend server that you, the user, deploy and operate yourself. The app developer does not run any server, does not collect telemetry, and does not have access to your data."
+                    }
+
+                    PolicySection(title: "2. Data the app collects on your device") {
+                        "With your permission, the app reads health and fitness data from Apple HealthKit, including but not limited to: heart rate, heart rate variability (HRV), blood oxygen (SpO2), respiratory rate, body temperature, steps, distance, active and basal energy, exercise minutes, stand hours, workouts, sleep analysis (in-bed / core / deep / REM / awake), mindful sessions, and related wearable measurements. The app also stores the text of your conversations with the AI agent and the configuration you enter (server address, optional auth token, app preferences). The app does NOT read contacts, photos, location, microphone, camera, or any other personal data outside HealthKit."
+                    }
+
+                    PolicySection(title: "3. How the app collects data") {
+                        "Health data is read from Apple HealthKit using HealthKit observer queries that the user authorises on the \"Apple Health Access\" onboarding page. The app never writes to HealthKit. Conversation text is provided directly by the user when they message the AI agent. Configuration is entered manually by the user."
+                    }
+
+                    PolicySection(title: "4. How the app uses data") {
+                        "Collected data is forwarded to the Hime backend server that you deploy and configure in the app's Settings. Your server stores the data locally and uses it to: (a) compute statistics for the on-device dashboard; (b) generate AI-driven health reports and chat replies; (c) trigger health alerts based on rules you define. The app developer never receives any of your data."
+                    }
+
+                    PolicySection(title: "5. Sharing with third-party AI services") {
+                        "Your Hime server makes API calls to a third-party Large Language Model (LLM) provider that you select via the DEFAULT_LLM_PROVIDER setting on your server. Supported providers include: OpenAI, Anthropic, Google (Gemini / Vertex AI), Mistral, Groq, DeepSeek, xAI, OpenRouter, Perplexity, Amazon Bedrock, Azure OpenAI, ZhipuAI, MiniMax, or a self-hosted vLLM endpoint.\n\nWhen the AI agent runs, the following may be sent to the chosen provider: numeric health metrics (with timestamps and units), summaries derived from your data, the text of your messages, and prompts/instructions assembled by the agent. Each provider processes the data under its own terms of service and privacy policy. You can review the providers' policies on their respective websites. We require you to confirm that the provider you choose offers data protection equal to or stronger than what is described in this policy.\n\nHime does not share data with any other third party (no analytics SDKs, no advertising networks, no crash-reporting services that exfiltrate data)."
+                    }
+
+                    PolicySection(title: "6. Data storage and retention") {
+                        "Data is stored on your iPhone (HealthKit-derived caches, conversation history, configuration in UserDefaults) and on the Hime server you operate (per-user SQLite databases, agent memory, generated reports). Retention is fully under your control: deleting the app removes all on-device data; resetting your server wipes all server-side data. Third-party AI providers may retain prompt/response logs according to their own policies."
+                    }
+
+                    PolicySection(title: "7. Your consent and your controls") {
+                        "Before any data is shared with a third-party AI service, the app requires your explicit consent on the \"AI Data Sharing\" onboarding page. You can withdraw consent at any time in Settings → Data & Privacy → Revoke Consent. Revoking consent disconnects the app from your server and returns you to onboarding; no data is sent until you re-consent. You can also revoke HealthKit access in the iOS Settings app at any time."
+                    }
+
+                    PolicySection(title: "8. Security") {
+                        "Communication between the app and your server uses HTTPS when you configure an HTTPS server URL. An optional bearer token (API_AUTH_TOKEN) authenticates every request when set. Server-side, dynamically generated personalised pages run under a strict Content Security Policy and a sandbox that blocks dangerous imports. SQL accepted from the agent is validated to prevent destructive statements against health data."
+                    }
+
+                    PolicySection(title: "9. Children") {
+                        "Hime is not directed to children under 13. Do not use the app if you are under the minimum age of digital consent in your jurisdiction."
+                    }
+
+                    PolicySection(title: "10. Changes to this policy") {
+                        "If material changes are made, the in-app version of this policy will be updated and the app will request fresh consent on next launch."
+                    }
+
+                    PolicySection(title: "11. Contact") {
+                        "Questions about this policy or the project can be raised at https://github.com/thinkwee/HiMe/issues."
+                    }
+                }
+                .padding(20)
+            }
+            .navigationTitle("Privacy Policy")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct PolicyHeading: View {
+    let text: LocalizedStringKey
+    init(_ text: LocalizedStringKey) { self.text = text }
+    var body: some View {
+        Text(text).font(.title2.bold())
+    }
+}
+
+private struct PolicyMeta: View {
+    let text: LocalizedStringKey
+    init(_ text: LocalizedStringKey) { self.text = text }
+    var body: some View {
+        Text(text).font(.caption).foregroundColor(HimeColor.ink2)
+    }
+}
+
+private struct PolicySection: View {
+    let title: LocalizedStringKey
+    let bodyText: LocalizedStringKey
+    init(title: LocalizedStringKey, content: () -> LocalizedStringKey) {
+        self.title = title
+        self.bodyText = content()
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline)
+            Text(bodyText)
+                .font(.callout)
+                .foregroundColor(HimeColor.ink)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct DisclosureRow: View {
+    let icon: String
+    let title: LocalizedStringKey
+    let text: LocalizedStringKey
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundColor(HimeColor.accentStrong)
+                .frame(width: 22)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.footnote.weight(.semibold))
+                Text(text)
+                    .font(.caption)
+                    .foregroundColor(HimeColor.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}

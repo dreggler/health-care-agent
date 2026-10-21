@@ -1,0 +1,288 @@
+# HiMe — Detailed Install Guide
+
+The README's Quick Start covers the happy path. This document covers everything else: manual Docker setup, native dev install, public deployment, IM gateway details, iOS build from source, and customization.
+
+## Table of Contents
+
+- [Manual Docker setup](#manual-docker-setup)
+- [Native dev install](#native-dev-install)
+- [Public deployment](#public-deployment)
+- [In-app iOS chat (default)](#in-app-ios-chat-default)
+  - [Optional: vision (image uploads)](#optional-vision-image-uploads)
+  - [Optional: APNs background push](#optional-apns-background-push)
+- [IM gateway setup (optional)](#im-gateway-setup-optional)
+  - [Telegram](#telegram)
+  - [Feishu (Lark)](#feishu-lark)
+  - [WeChat (Weixin ClawBot)](#wechat-weixin-clawbot)
+- [iOS app](#ios-app)
+- [Customization](#customization)
+  - [Switching LLM providers](#switching-llm-providers)
+  - [Fallback provider chain](#fallback-provider-chain)
+  - [Reasoning effort (GPT-5 family)](#reasoning-effort-gpt-5-family)
+  - [Skills](#skills)
+  - [Personalised pages](#personalised-pages)
+- [Troubleshooting](#troubleshooting)
+
+## Manual Docker setup
+
+If you want full control over the wizard's choices, edit `.env` directly:
+
+```bash
+git clone https://github.com/thinkwee/HiMe.git HiMe
+cd HiMe
+cp .env.example .env
+# Edit .env and at minimum set DEFAULT_LLM_PROVIDER + the matching *_API_KEY.
+# IM gateway blocks are optional if you use the built-in in-app iOS chat.
+docker compose up --build -d
+```
+
+Endpoints when ready:
+
+- Dashboard: http://localhost:5173
+- Backend API: http://localhost:8000
+- Watch exporter: http://localhost:8765/ping
+
+### API token and the dashboard
+
+`./setup.sh` always generates an `API_AUTH_TOKEN` (a manual `.env` may leave it
+empty, which disables auth). When a token is set, every `/api/*` call and every
+WebSocket stream requires it — including the dashboard's.
+
+The dashboard asks for it in the browser: the first `401` opens a small prompt,
+you paste the value of `API_AUTH_TOKEN` from `.env`, and it is stored in that
+tab's `sessionStorage` (or in `localStorage` if you tick **Remember on this
+device**) and reused for every request and WebSocket afterwards. Nothing has to
+be rebuilt, and the token is never baked into the JavaScript bundle — which
+matters because `dist/` is served to anyone who can load the page.
+
+To sign out of a browser, clear the site's storage (DevTools → Application →
+Storage → Clear site data).
+
+## Native dev install
+
+For developers iterating on the code (Python venv + Vite dev server, no Docker):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+cp .env.example .env  # configure
+./hime.sh start  # starts backend + frontend + watch exporter
+```
+
+`./hime.sh` is the developer's native-mode CLI; full reference: `./hime.sh help`. For backend-only work, `python -m backend.main` runs the API server in isolation; set `HIME_DEV_RELOAD=true` to enable Uvicorn auto-reload. The frontend lives in `frontend/` (`npm install && npm run dev`). See [`docs/DEVELOPMENT.md`](DEVELOPMENT.md) for full developer onboarding.
+
+## Public deployment
+
+Mostly defer to [`docs/DEPLOYMENT.md`](DEPLOYMENT.md), but the critical steps are:
+
+1. Set a strong `API_AUTH_TOKEN` in `.env` (`openssl rand -hex 32`).
+2. Add your public origin to `CORS_ORIGINS=`.
+3. Reverse-proxy the backend (8000) as `api.<your-domain>` and the Watch Exporter (8765) as `watch.<your-domain>` behind nginx/Caddy with TLS — the iOS app expects exactly these subdomains. Do NOT expose the service ports directly (bind them to 127.0.0.1 on a VPS).
+4. Configure the iOS app with the same `API_AUTH_TOKEN` in Settings → Auth Token.
+5. Set `CODE_TOOL_DOCKER_SANDBOX=true` once the agent is reachable by anyone other than you. The `code` tool runs agent-written Python **in-process** by default (no import sandbox) — acceptable for a single-user, default-deny deployment where only you can message the agent, but a code-execution risk the moment the trust boundary widens (extra allowlisted chats, a shared/public endpoint, or untrusted data that could carry prompt injection). The Docker sandbox isolates execution, at the cost of the persistent-notebook session.
+
+Full nginx + Caddy examples: [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+
+## In-app iOS chat (default)
+
+By default HiMe uses the **native iOS chat** built into the iPhone app — no Telegram/Feishu/WeChat bot required. The React dashboard is for monitoring, reports, and configuration; it does not host a chat UI.
+
+How it works:
+
+1. **Inbound:** the app sends text (and optionally images) with `POST /api/agent/chat` on the backend (`:8000`).
+2. **Outbound (live):** replies stream over `WS /api/stream/agent/LiveUser?client=ios` as `chat_thinking`, `chat_content`, `chat_reply`, and `chat_image` events.
+3. **History:** past turns are stored in the memory DB and reloaded via `GET /api/agent/chat-history` after a restart.
+4. **Onboarding plan:** after the goal survey, a one-shot **plan designer** run creates `scheduled_tasks` and publishes an introductory plan report.
+
+Ensure these are set in `.env` (defaults are already correct for a fresh install):
+
+```bash
+IOS_GATEWAY_ENABLED=true
+```
+
+If `API_AUTH_TOKEN` is set, paste the same token in the iOS app under **Settings → Auth Token**. The chat WebSocket passes it as `?token=...`.
+
+The agent must be running (`POST /api/agent/start` or auto-restore). If you send a message while the agent is still starting, the API returns `status: starting` — wait for the `agent_started` event on the stream and retry.
+
+### Optional: vision (image uploads)
+
+To let the user attach photos in chat:
+
+```bash
+IOS_VISION_ENABLED=true
+```
+
+Use a vision-capable provider/model (`anthropic`, `gemini`, or `openai`). Non-vision providers receive a text-only fallback note. Max upload size: `IOS_MAX_IMAGE_BYTES` (default 5 MiB).
+
+### Optional: APNs background push
+
+When the app is closed or backgrounded it disconnects the stream socket; replies are still persisted and appear on next open. To also show an iOS notification banner:
+
+1. Create an **APNs Auth Key** (`.p8`) in your Apple Developer account.
+2. Install the optional dependency (included in `backend/requirements.txt`): `pip install aioapns` (or reinstall requirements).
+3. In `.env`:
+
+   ```bash
+   APNS_ENABLED=true
+   APNS_KEY_PATH=/path/to/AuthKey_XXXX.p8   # never commit — see .gitignore
+   APNS_KEY_ID=<10-char key id>
+   APNS_TEAM_ID=<10-char team id>
+   APNS_BUNDLE_ID=com.example.hime          # must match the app bundle id
+   APNS_ENV=production                      # fallback only: each token is sent via the env the app registered (sandbox for Xcode, production for TestFlight/App Store)
+   ```
+
+4. Build the iOS app with the Push Notifications capability and register the device token (the app calls `POST /api/devices/register` after permission is granted).
+
+If APNs is disabled, behaviour is unchanged except there is no banner — messages still land in chat history.
+
+## IM gateway setup (optional)
+
+Use an IM app **instead of or alongside** the built-in iOS chat. Pick Telegram, Feishu, or WeChat (most people use in-app chat only, or one IM channel as a backup).
+
+### Telegram
+
+1. Open [@BotFather](https://t.me/BotFather) → `/newbot` → follow prompts → save the bot **token**.
+2. Open [@userinfobot](https://t.me/userinfobot) → `/start` → save the **chat_id** (numeric).
+3. Send `/start` to your new bot once so Telegram allows the bot to message you back.
+4. In `.env`:
+
+   ```bash
+   TELEGRAM_GATEWAY_ENABLED=true
+   TELEGRAM_TOKEN=<bot_token>
+   CHAT_ID=<chat_id>
+   TELEGRAM_ALLOWED_CHAT_IDS=<chat_id>
+   ```
+
+### Feishu (Lark)
+
+1. Visit [open.feishu.cn](https://open.feishu.cn) → "开发者后台" → "创建企业自建应用".
+2. After creation: "凭证与基础信息" → save **APP_ID** (`cli_...`) and **APP_SECRET**.
+3. "权限管理" → grant `im:message`, `im:message:send_as_bot`, `im:chat`, `im:chat:readonly` (and others as needed).
+4. "事件订阅" → choose "长连接" (long-poll WebSocket) — no public URL needed.
+5. Publish the app draft and add it to a group chat.
+6. Get the **open_chat_id** (`oc_...`) by inviting the bot to a group and querying `/open-apis/im/v1/chats` with the bot token (or check the message events the bot receives).
+7. In `.env`:
+
+   ```bash
+   FEISHU_GATEWAY_ENABLED=true
+   FEISHU_APP_ID=cli_xxx
+   FEISHU_APP_SECRET=...
+   FEISHU_DEFAULT_CHAT_ID=oc_xxx
+   FEISHU_ALLOWED_CHAT_IDS=oc_xxx
+   FEISHU_TRANSPORT=ws
+   ```
+
+### WeChat (Weixin ClawBot)
+
+WeChat support is provided through Tencent's official **ClawBot** plugin (the iLink bot protocol at `ilinkai.weixin.qq.com`). No developer console, no API keys — just one QR scan from your personal WeChat. Limitations: text-only messages (no images yet), and proactive pushes require the user to have messaged the bot at least once.
+
+1. In `.env`, enable the gateway:
+
+   ```bash
+   WEIXIN_GATEWAY_ENABLED=true
+   ```
+
+   You can leave `WEIXIN_ALLOWED_USER_IDS` and `WEIXIN_DEFAULT_USER_ID` blank — by default the bot trusts whoever scanned the QR.
+
+2. From the host running HiMe, generate a `bot_token` by scanning a QR:
+
+   ```bash
+   # Native install
+   python -m backend.weixin.qr_login
+
+   # Docker install — run inside the backend container so the token lands
+   # at the path the gateway reads (./data/weixin_bot_token.json).
+   docker exec -it hime-backend python -m backend.weixin.qr_login
+   ```
+
+   The script prints both a URL and an ANSI-rendered QR (install `qrcode` if it's missing, but it ships in `requirements.txt`). On your phone open **WeChat → Settings → Plugins → ClawBot** and scan. The script will progress through `wait → scaned → confirmed` and write the token to `./data/weixin_bot_token.json`.
+
+3. Restart HiMe — `./hime.sh restart` for native, `docker compose restart hime-backend` for Docker. The backend log should print `WeChat (Weixin) Gateway started`.
+
+4. In WeChat, search for the ClawBot you just bound (it appears as a regular contact named "微信Claw" or similar) and send a message. The agent replies in the same chat.
+
+The token is long-lived; re-run step 2 only if the backend log starts reporting `iLink: 401 Unauthorized`.
+
+## iOS app
+
+### Easy path
+
+Install [HiMe on the App Store](https://apps.apple.com/app/id6762160735). Open the app → **Settings** → enter your **Server URL**, then use the **Chat** tab for in-app conversation (streaming replies, evidence, optional images). Complete the onboarding goal survey on first launch; the agent designs recurring check-ins from your answers. Redesign the plan anytime from **Settings**.
+
+### App tabs (build from source)
+
+Reports, Dashboard, Collected Data, **Chat**, Cat Home, Personalised Pages, plus onboarding / goal survey flows (`GoalSurveyView`, `PlanSurveySheet`).
+
+`Server URL` accepts:
+
+- `localhost` — iPhone simulator on the same Mac running the backend.
+- `192.168.1.100` — Mac/Linux backend on the same Wi-Fi LAN.
+- `homelab.local` — mDNS hostname on the same LAN (works if the host publishes via Avahi/Bonjour).
+- `example.com` — your public domain (with `https://api.example.com` and `wss://watch.example.com` derived automatically; requires reverse-proxy setup from [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)).
+
+If `API_AUTH_TOKEN` is set on the server, paste the same value into Settings → Auth Token.
+
+### Build from source
+
+1. Open `ios/hime/hime.xcodeproj` in Xcode 16+.
+2. `cp ios/hime/Config.xcconfig.template ios/hime/Config.xcconfig` and fill in `DEVELOPMENT_TEAM` (your Apple team ID) and `BUNDLE_ID_PREFIX` (e.g. `com.example`).
+3. ⌘R to build and run.
+
+## Customization
+
+### Switching LLM providers
+
+`.env` controls everything:
+
+```bash
+DEFAULT_LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-...
+DEFAULT_MODEL=claude-sonnet-4-6   # optional override; omit to use provider mid-tier default
+```
+
+Supported providers (matches `backend/agent/llm/__init__.py`): `gemini`, `openai`, `azure_openai`, `anthropic`, `mistral`, `groq`, `deepseek`, `xai`, `openrouter`, `perplexity`, `google_vertex`, `amazon_bedrock`, `minimax`, `vllm`, `zhipuai`.
+
+Each has a default model in `.env.example` under "Per-provider default models" — uncomment to override the default.
+
+### Fallback provider chain
+
+To automatically retry against a backup provider when the primary returns 503/529/overloaded three times in a row:
+
+```bash
+FALLBACK_LLM_PROVIDER=openai
+FALLBACK_LLM_MODEL=gpt-5.4-mini
+```
+
+### Reasoning effort (GPT-5 family)
+
+```bash
+OPENAI_REASONING_EFFORT=low   # minimal | low | medium | high | xhigh | none
+```
+
+For agentic tool-calling, recommended `low` or `minimal`. Default `medium` is overkill for HiMe's loops.
+
+### Skills
+
+Skills are reusable analysis playbooks (`.md` files) under `./skills/`. The registry also auto-scans `~/.hime/skills` so you can add personal skills outside the repo. Toggle individual skills via the dashboard's Skills tab.
+
+### Personalised pages
+
+The agent can generate single-page apps on demand using the `create_page` tool. Pages live under `data/personalised_pages/<page_id>/` and use the bundled `HimeUI` JS component library at `data/personalised_pages/_shared/`. Spec: [`prompts/create_page_guide.md`](../prompts/create_page_guide.md).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `setup.sh: Docker daemon not running` | Docker Desktop not started | Start Docker Desktop and re-run `./setup.sh` |
+| `setup.sh` finishes but nothing responds | Containers crashed | `docker compose logs -f --tail=100` |
+| iOS app shows "Cannot connect" | Wrong Server URL or firewall | `curl http://<host>:8765/ping` from another LAN device |
+| `401 Unauthorized` from API | `API_AUTH_TOKEN` mismatch | Set the same value in iOS app's Settings → Auth Token |
+| Dashboard keeps asking for the API token | Pasted token ≠ `API_AUTH_TOKEN` in `.env` | Copy the value from `.env` (`grep API_AUTH_TOKEN .env`); it is re-asked on every 401 |
+| Telegram bot silent | `TELEGRAM_ALLOWED_CHAT_IDS` empty | Add your chat_id to the allowlist (setup.sh handles this) |
+| Feishu card buttons do nothing | Feishu Card Request URL not set | Set the public callback URL in Feishu console — see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) |
+| WeChat bot silent after restart | Token file missing or expired | Re-run `python -m backend.weixin.qr_login` and re-scan; check that `./data/weixin_bot_token.json` exists |
+| WeChat `iLink: 401 Unauthorized` in logs | `bot_token` revoked | Re-run the QR login; bot tokens stay valid until you log out from WeChat → Settings → Plugins → ClawBot |
+| WeChat agent never sees the message | Gateway disabled or not loaded | `docker exec hime-backend env \| grep WEIXIN_GATEWAY_ENABLED` — must be `true`; trailing `# comments` after `=` get treated as the value, strip them |
+
+For deeper debugging see logs in `./logs/backend.log` (or `docker compose logs backend`).

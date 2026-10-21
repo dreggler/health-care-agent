@@ -1,0 +1,278 @@
+import SwiftUI
+
+
+struct ReportsView: View {
+    @StateObject private var viewModel = DashboardViewModel.shared
+    @State private var hasStarted = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                ReportsListSection(viewModel: viewModel)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .background(HimeColor.paper)
+        .onAppear {
+            if !hasStarted {
+                hasStarted = true
+            }
+            viewModel.startRefreshing()
+        }
+        .onDisappear {
+            viewModel.stopRefreshing()
+        }
+        .refreshable {
+            await viewModel.refreshAll()
+        }
+    }
+}
+
+
+struct ReportsListSection: View {
+    @ObservedObject var viewModel: DashboardViewModel
+
+
+    var expandTargetId: Int? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Agent Reports")
+                    .font(.headline)
+                    .foregroundColor(HimeColor.ink)
+                Spacer()
+                if !viewModel.reports.isEmpty {
+                    Text("\(viewModel.reports.count)")
+                        .font(.caption2.weight(.bold))
+                        .foregroundColor(HimeColor.ink2)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(HimeColor.paper)
+                        .clipShape(Capsule())
+                }
+            }
+
+            if viewModel.isAgentRunning {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(HimeColor.ok)
+                        .frame(width: 6, height: 6)
+                    Text("Agent running")
+                        .font(.caption2)
+                        .foregroundColor(HimeColor.ok)
+                    if let model = viewModel.agentModel {
+                        Text("(\(model))")
+                            .font(.caption2)
+                            .foregroundColor(HimeColor.ink2)
+                    }
+                }
+            }
+
+            if viewModel.reports.isEmpty && !viewModel.isLoadingReports {
+                ReportsEmptyView()
+            } else {
+                ForEach(viewModel.reports) { report in
+                    ReportRow(report: report, viewModel: viewModel,
+                              forceExpand: report.id == expandTargetId)
+                        .id("report-\(report.id)")
+                }
+            }
+        }
+
+
+        .onChange(of: viewModel.isLoadingReports) { _, loading in
+            if !loading { clearStaleReportTarget() }
+        }
+    }
+
+    private func clearStaleReportTarget() {
+        guard let id = expandTargetId,
+              !viewModel.reports.contains(where: { $0.id == id }) else { return }
+        AppRouter.shared.pendingReportId = nil
+    }
+}
+
+
+struct ReportsEmptyView: View {
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .font(.system(size: 32))
+                .foregroundColor(HimeColor.ink2.opacity(0.5))
+            Text("No reports yet")
+                .font(.subheadline)
+                .foregroundColor(HimeColor.ink2)
+            Text("Start the agent to generate health insights and reports.")
+                .font(.caption)
+                .foregroundColor(HimeColor.ink2)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
+    }
+}
+
+
+struct ReportRow: View {
+    let report: AgentReport
+    @ObservedObject var viewModel: DashboardViewModel
+
+    var forceExpand: Bool = false
+    @State private var isExpanded: Bool = false
+    @State private var showDeleteConfirm: Bool = false
+
+    private var alertColor: Color {
+        switch viewModel.alertColor(for: report.alert_level) {
+        case "red":    return HimeColor.bad
+        case "orange": return HimeColor.warn
+        case "blue":   return HimeColor.sky
+        default:       return HimeColor.ok
+        }
+    }
+
+    private var alertIcon: String {
+        switch report.alert_level?.lowercased() {
+        case "critical", "high": return "exclamationmark.triangle.fill"
+        case "warning", "medium": return "exclamationmark.circle.fill"
+        case "info", "low":       return "info.circle.fill"
+        default:                  return "checkmark.circle.fill"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 10) {
+
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(alertColor)
+                        .frame(width: 4, height: 36)
+
+                    Image(systemName: alertIcon)
+                        .font(.subheadline)
+                        .foregroundColor(alertColor)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(report.title ?? "Health Report")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(HimeColor.ink)
+                            .lineLimit(isExpanded ? nil : 1)
+
+                        if let timestamp = report.created_at {
+                            Text(formatTimestamp(timestamp))
+                                .font(.caption2)
+                                .foregroundColor(HimeColor.ink2)
+                        }
+                    }
+
+                    Spacer()
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(HimeColor.ink2)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                Divider()
+
+                MarkdownView(text: report.content, foreground: HimeColor.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack {
+                    Button {
+                        showDeleteConfirm = true
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(HimeColor.bad)
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    if let level = report.alert_level {
+                        Text(level.uppercased())
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(alertColor)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(alertColor.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(HimeColor.card)
+        .clipShape(RoundedRectangle(cornerRadius: HimeRadius.row, style: .continuous))
+        .contextMenu {
+            Button(role: .destructive) {
+                showDeleteConfirm = true
+            } label: {
+                Label("Delete Report", systemImage: "trash")
+            }
+        }
+        .alert("Delete this report?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                Task { await viewModel.deleteReport(id: report.id) }
+            }
+        } message: {
+            Text("This will remove the report from your server. This cannot be undone.")
+        }
+        .onAppear { applyForceExpand() }
+        .onChange(of: forceExpand) { _, expand in if expand { applyForceExpand() } }
+    }
+
+
+    private func applyForceExpand() {
+        guard forceExpand else { return }
+        if !isExpanded {
+            withAnimation(.easeInOut(duration: 0.2)) { isExpanded = true }
+        }
+        AppRouter.shared.pendingReportId = nil
+    }
+
+    private func formatTimestamp(_ ts: String) -> String {
+
+
+        let hasTZ = ts.hasSuffix("Z") || ts.contains("+") || (ts.count > 19 && ts.dropFirst(19).contains("-"))
+        let utcTs = hasTZ ? ts : ts + "Z"
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: utcTs) {
+            let relative = RelativeDateTimeFormatter()
+            relative.unitsStyle = .abbreviated
+            return relative.localizedString(for: date, relativeTo: Date())
+        }
+
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: utcTs) {
+            let relative = RelativeDateTimeFormatter()
+            relative.unitsStyle = .abbreviated
+            return relative.localizedString(for: date, relativeTo: Date())
+        }
+
+        let sqlFormatter = DateFormatter()
+
+
+        sqlFormatter.locale = Locale(identifier: "en_US_POSIX")
+        sqlFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        sqlFormatter.timeZone = TimeZone(identifier: "UTC")
+        if let date = sqlFormatter.date(from: ts) {
+            let relative = RelativeDateTimeFormatter()
+            relative.unitsStyle = .abbreviated
+            return relative.localizedString(for: date, relativeTo: Date())
+        }
+        return String(ts.prefix(16))
+    }
+}

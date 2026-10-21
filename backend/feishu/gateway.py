@@ -1,0 +1,288 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from ..i18n import t
+from ..messaging.base import BaseGateway, MessageChannel, MessageEnvelope
+from .cards import build_plain_card
+from .sender import FeishuSender, markdown_to_feishu_post
+from .transport import FeishuWebhookTransport, make_transport
+
+logger = logging.getLogger(__name__)
+
+
+OnUserMessage = Callable[[MessageEnvelope], Awaitable[None]]
+
+
+class FeishuGateway(BaseGateway):
+
+    channel = MessageChannel.FEISHU
+
+    def __init__(
+        self,
+        settings: Any,
+        on_user_message: OnUserMessage | None = None,
+        get_memory_manager: Callable[[str], Any] | None = None,
+        allowed_chat_ids: set[str] | None = None,
+    ) -> None:
+        self._settings = settings
+        self._on_user_message = on_user_message
+        self._get_memory_manager = get_memory_manager or (lambda pid: None)
+
+        self.default_chat_id = getattr(settings, "FEISHU_DEFAULT_CHAT_ID", "") or None
+
+        if allowed_chat_ids is None:
+            raw = getattr(settings, "FEISHU_ALLOWED_CHAT_IDS", "") or ""
+            allowed: set[str] = {
+                cid.strip() for cid in raw.split(",") if cid.strip()
+            }
+            if self.default_chat_id:
+                allowed.add(self.default_chat_id)
+            allowed_chat_ids = allowed
+        self.allowed_chat_ids = allowed_chat_ids
+
+        self.sender = FeishuSender(
+            app_id=getattr(settings, "FEISHU_APP_ID", ""),
+            app_secret=getattr(settings, "FEISHU_APP_SECRET", ""),
+            default_chat_id=self.default_chat_id,
+        )
+
+        self._transport = make_transport(
+            settings=settings,
+            on_message=self._handle_message,
+            on_card_action=self._handle_card_action,
+            allowed_chat_ids=self.allowed_chat_ids,
+        )
+
+        self._has_webhook_secret = bool(
+            getattr(settings, "FEISHU_VERIFICATION_TOKEN", "")
+            or getattr(settings, "FEISHU_ENCRYPT_KEY", "")
+        )
+        if isinstance(self._transport, FeishuWebhookTransport) and not self._has_webhook_secret:
+            msg = (
+                "FEISHU_TRANSPORT=webhook requires FEISHU_VERIFICATION_TOKEN "
+                "or FEISHU_ENCRYPT_KEY (neither is set) — refusing to start the "
+                "Feishu gateway because its webhook would accept forged events. "
+                "Set one of them (Feishu console > Events & Callbacks), or use "
+                "FEISHU_TRANSPORT=ws."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+
+        if isinstance(self._transport, FeishuWebhookTransport):
+            self._card_webhook = self._transport
+        else:
+            self._card_webhook = FeishuWebhookTransport(
+                on_message=self._handle_message,
+                on_card_action=self._handle_card_action,
+                allowed_chat_ids=self.allowed_chat_ids,
+                webhook_path=getattr(
+                    settings, "FEISHU_WEBHOOK_PATH", "/api/feishu/webhook",
+                ),
+                verification_token=getattr(
+                    settings, "FEISHU_VERIFICATION_TOKEN", "",
+                ),
+                encrypt_key=getattr(settings, "FEISHU_ENCRYPT_KEY", ""),
+            )
+
+        self._fact_verifiers: dict[str, Any] = {}
+
+
+    async def start(self) -> None:
+        await self.sender.start()
+        await self._transport.start()
+        logger.info(
+            "FeishuGateway started (transport=%s)",
+            getattr(self._settings, "FEISHU_TRANSPORT", "ws"),
+        )
+
+    async def stop(self) -> None:
+        try:
+            await self._transport.stop()
+        finally:
+            await self.sender.stop()
+        logger.info("FeishuGateway stopped")
+
+
+    async def _handle_message(self, envelope: MessageEnvelope) -> None:
+        logger.info(
+            "Feishu message from %s (chat=%s): %s",
+            envelope.sender_id,
+            envelope.chat_id,
+            (envelope.content or "")[:80],
+        )
+        if self._on_user_message is None:
+            logger.warning("FeishuGateway: no on_user_message handler configured")
+            return
+        try:
+            await self._on_user_message(envelope)
+        except Exception as exc:
+            logger.error("FeishuGateway on_user_message error: %s", exc, exc_info=True)
+
+    async def _handle_card_action(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            import json as _json
+
+            payload = event.get("event", {}) or {}
+            logger.info(
+                "Feishu card action received: keys=%s",
+                list(payload.keys()),
+            )
+            try:
+                logger.info(
+                    "Feishu card action payload: %s",
+                    _json.dumps(payload, ensure_ascii=False, default=str)[:2000],
+                )
+            except Exception:
+                pass
+
+            action = payload.get("action", {}) or {}
+            value = action.get("value", {}) or {}
+            if isinstance(value, str):
+                try:
+                    value = _json.loads(value)
+                except Exception:
+                    value = {}
+            verb = value.get("action", "")
+            msg_hash = value.get("hash", "")
+
+            context = payload.get("context") or {}
+            host = payload.get("host") or {}
+            chat_id = (
+                context.get("open_chat_id")
+                or (host.get("open_chat_id") if isinstance(host, dict) else None)
+                or payload.get("open_chat_id")
+                or context.get("chat_id")
+                or ""
+            )
+
+            if not verb or not msg_hash:
+                logger.warning(
+                    "Feishu card action missing fields: verb=%r hash=%r chat_id=%r",
+                    verb, msg_hash, chat_id,
+                )
+                return None
+
+            if verb != "evidence":
+                logger.info("Feishu card action: ignoring verb=%s", verb)
+                return None
+
+            if not chat_id:
+                logger.warning("Feishu card action: no chat_id available, cannot reply")
+                return None
+
+            if self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids:
+                logger.warning(
+                    "Feishu card action: rejecting non-allowlisted chat_id=%s", chat_id,
+                )
+                return None
+
+            verifier = self._get_fact_verifier()
+            evidence = await asyncio.to_thread(verifier.get_evidence, msg_hash)
+            if not evidence:
+                logger.info("Feishu card action: no evidence for hash=%s", msg_hash)
+                return None
+
+            body_text = await asyncio.to_thread(
+                verifier.format_evidence_for_display, evidence,
+            )
+            evidence_header = t("card.evidence_header")
+            evidence_card = build_plain_card(
+                markdown_to_feishu_post(
+                    f"\U0001f50d **{evidence_header}**\n\n{body_text}"
+                ),
+            )
+
+            ok = await self.sender.send_card(chat_id, evidence_card)
+            logger.info(
+                "Feishu evidence reply sent: ok=%s chat_id=%s hash=%s",
+                ok, chat_id, msg_hash,
+            )
+            return None
+        except Exception as exc:
+            logger.error("FeishuGateway card action handler error: %s", exc, exc_info=True)
+            return None
+
+    def _get_fact_verifier(self, user_id: str = "LiveUser") -> Any:
+        if user_id not in self._fact_verifiers:
+            from ..agent.fact_verifier import FactVerifier
+            from ..config import settings as _settings
+
+            self._fact_verifiers[user_id] = FactVerifier(
+                _settings.MEMORY_DB_PATH, user_id,
+            )
+        return self._fact_verifiers[user_id]
+
+
+    async def send_message(
+        self,
+        text: str,
+        chat_id: str | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        target = chat_id or self.default_chat_id or ""
+        if not target:
+            logger.warning("FeishuGateway.send_message: no chat_id available")
+            return False
+        return await self.sender.send_message(
+            chat_id=target, text=text, reply_markup=reply_markup,
+        )
+
+    async def send_photo(
+        self,
+        photo_path: str,
+        caption: str = "",
+        chat_id: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        target = chat_id or self.default_chat_id or ""
+        if not target:
+            logger.warning("FeishuGateway.send_photo: no chat_id available")
+            return False
+        return await self.sender.send_photo(
+            chat_id=target,
+            image_path=photo_path,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: Any,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        return await self.sender.edit_message(
+            message_id=str(message_id),
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+    async def answer_callback(
+        self,
+        callback_id: str,
+        text: str = "",
+        show_alert: bool = False,
+    ) -> bool:
+        return await self.sender.answer_callback(
+            callback_id=callback_id, text=text, show_alert=show_alert,
+        )
+
+    def is_muted(self) -> bool:
+        return self.sender.is_muted()
+
+
+    def register_routes(self, app: Any) -> None:
+        if not self._has_webhook_secret:
+            logger.warning(
+                "Feishu card-callback route not mounted: set "
+                "FEISHU_VERIFICATION_TOKEN (or FEISHU_ENCRYPT_KEY) to enable "
+                "interactive card buttons."
+            )
+            return
+        self._card_webhook.register_routes(app)
